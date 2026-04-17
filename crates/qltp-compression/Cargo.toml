@@ -1,0 +1,20 @@
+[package]
+name = "qltp-compression"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Compression layer for QLTP file transfer"
+
+[dependencies]
+lz4 = { workspace = true }
+zstd = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }

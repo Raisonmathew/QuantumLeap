@@ -1,0 +1,33 @@
+[package]
+name = "qltp-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core engine for QLTP file transfer protocol"
+
+[dependencies]
+qltp-compression = { path = "../qltp-compression" }
+qltp-storage = { path = "../qltp-storage" }
+qltp-transport = { path = "../qltp-transport" }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+hex = "0.4"
+lz4_flex = "0.11"
+zstd = "0.13"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+criterion = { workspace = true }
+proptest = { workspace = true }
+tempfile = "3.8"

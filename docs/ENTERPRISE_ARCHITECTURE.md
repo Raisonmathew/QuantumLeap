@@ -1,0 +1,1921 @@
+# QLTP Enterprise Architecture: High-Performance P2P File Transfer
+
+**Version**: 1.0  
+**Date**: 2026-04-15  
+**Status**: Design Complete - Ready for Implementation
+
+---
+
+## Executive Summary
+
+Transform QLTP into an **enterprise-grade P2P file transfer system** capable of transferring **1GB in 1 second** (8,000-10,000 MB/s) using advanced kernel bypass technologies (io_uring and DPDK).
+
+### Key Achievements
+
+| Metric | Current | Target | Improvement |
+|--------|---------|--------|-------------|
+| **Transfer Speed** | 120 MB/s | 8,000 MB/s | **67x faster** |
+| **1GB Transfer Time** | 8.3 seconds | 0.125 seconds | **66x faster** |
+| **CPU Overhead** | 80% | 15% | **5x more efficient** |
+
+### Technology Stack
+
+```
+Performance Tier          Technology           Speed        Hardware Required
+──────────────────────────────────────────────────────────────────────────────
+Enterprise (Tier 4)       io_uring + 25GbE    25 GB/s      Standard 25GbE NIC
+
+### Hardware Requirements (No Special Hardware Needed!)
+
+**Recommended Setup (Standard Hardware)**:
+```
+Component              Requirement           Cost        Performance
+─────────────────────────────────────────────────────────────────────
+Network Card           10GbE (standard)      $200        8 GB/s
+                       25GbE (standard)      $400        25 GB/s
+Operating System       Linux 5.1+            Free        io_uring support
+Memory                 8GB RAM               Standard    Sufficient
+CPU                    4+ cores              Standard    Sufficient
+─────────────────────────────────────────────────────────────────────
+Total Cost             $200-400              Affordable  8-25 GB/s
+```
+
+**DPDK Alternative (Optional, Not Recommended)**:
+```
+Component              Requirement           Cost        Performance
+─────────────────────────────────────────────────────────────────────
+Network Card           Intel 82599ES         $2,000      10 GB/s
+                       (DPDK-compatible)
+CPU                    8+ dedicated cores    Expensive   Required
+Memory                 16GB+ with huge pages Complex     Required
+Setup Complexity       Very High             Time-consuming
+─────────────────────────────────────────────────────────────────────
+Total Cost             $2,000+               Expensive   10 GB/s
+```
+
+**Recommendation**: Use **io_uring with standard 10GbE/25GbE NICs**
+- ✅ **Same performance** as DPDK (8-25 GB/s)
+- ✅ **10x cheaper** ($200 vs $2,000)
+- ✅ **Much simpler** setup
+- ✅ **Works with any** standard NIC
+- ✅ **No dedicated** CPU cores needed
+
+Professional (Tier 3)     io_uring + 10GbE    8 GB/s       Standard 10GbE NIC
+Standard (Tier 2)         QUIC Enhanced       1 GB/s       Any NIC (1GbE+)
+Basic (Tier 1)            TCP                 120 MB/s     Any NIC
+──────────────────────────────────────────────────────────────────────────────
+Optional (Expert)         DPDK + Special NIC  10 GB/s      Special DPDK NIC ($$$)
+```
+
+**Key Insight**: io_uring achieves 8-25 GB/s with **standard NICs** - no special hardware needed!
+
+---
+
+## Architecture Overview
+
+### Layered Design
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    QLTP ENTERPRISE STACK                         │
+├─────────────────────────────────────────────────────────────────┤
+│  Application Layer (CLI/GUI/API)                                │
+│           ↓                                                      │
+│  Business Logic Layer (qltp-core)                               │
+│           ↓                                                      │
+│  Transport Abstraction Layer (NEW - qltp-transport)             │
+│  ┌──────────┬──────────┬──────────┬──────────────┐            │
+│  │ io_uring │   DPDK   │   QUIC   │  TCP (std)   │            │
+│  │  Linux   │  Expert  │  Modern  │  Universal   │            │
+│  │ 8GB/s    │ 10GB/s   │  1GB/s   │   120MB/s    │            │
+│  └──────────┴──────────┴──────────┴──────────────┘            │
+│           ↓                                                      │
+│  Network Layer (qltp-network)                                   │
+│           ↓                                                      │
+│  Infrastructure Layer (storage/auth/licensing)                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Flexible Deployment Model: P2P + Internet + Cloud
+
+QLTP supports **three deployment scenarios**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Scenario 1: Local P2P (Same Network)                            │
+│                                                                  │
+│  Device A ◄──────LAN 10GB/s──────► Device B                     │
+│  (Office)                          (Office)                     │
+│     │                                  │                         │
+│     └──────► Backend (Auth) ◄──────────┘                        │
+└─────────────────────────────────────────────────────────────────┘
+
+
+### Deployment Scenario Performance
+
+---
+
+## Complete System Architecture & Design
+
+### System Overview - All Components
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         QLTP COMPLETE SYSTEM                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │                    CLIENT APPLICATIONS                              │    │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │    │
+│  │  │   CLI App    │  │   GUI App    │  │   API Client │            │    │
+│  │  │  (Terminal)  │  │  (Desktop)   │  │  (Programmatic)│          │    │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘            │    │
+│  └─────────┼──────────────────┼──────────────────┼────────────────────┘    │
+│            │                  │                  │                          │
+│            └──────────────────┴──────────────────┘                          │
+│                               │                                             │
+│  ┌────────────────────────────┴────────────────────────────────────────┐   │
+│  │                    APPLICATION LAYER                                 │   │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │   │
+│  │  │  User Commands & Business Logic                                │ │   │
+│  │  │  • send/receive files                                          │ │   │
+│  │  │  • auth (register/login/logout)                                │ │   │
+│  │  │  • license (activate/status/upgrade)                           │ │   │
+│  │  │  • usage (show/sync/history)                                   │ │   │
+│  │  └────────────────────────────────────────────────────────────────┘ │   │
+│  └────────────────────────────┬────────────────────────────────────────┘   │
+│                               │                                             │
+│  ┌────────────────────────────┴────────────────────────────────────────┐   │
+│  │                    CORE BUSINESS LOGIC (qltp-core)                   │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │   │
+│  │  │   Transfer   │  │  Chunking &  │  │ Compression  │             │   │
+│  │  │ Orchestration│  │ Deduplication│  │ & Encryption │             │   │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘             │   │
+│  │         │                  │                  │                      │   │
+│  │  ┌──────┴──────────────────┴──────────────────┴───────┐            │   │
+│  │  │           Transfer Pipeline                         │            │   │
+│  │  │  1. Chunk file (content-defined)                   │            │   │
+│  │  │  2. Deduplicate chunks (SHA-256)                   │            │   │
+│  │  │  3. Compress chunks (LZ4/Zstd)                     │            │   │
+│  │  │  4. Encrypt chunks (TLS 1.3)                       │            │   │
+│  │  │  5. Send via transport layer                       │            │   │
+│  │  └────────────────────────────┬───────────────────────┘            │   │
+│  └────────────────────────────────┼────────────────────────────────────┘   │
+│                                   │                                         │
+│  ┌────────────────────────────────┴────────────────────────────────────┐   │
+│  │              TRANSPORT ABSTRACTION LAYER (NEW)                       │   │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │   │
+│  │  │  TransportManager - Intelligent Backend Selection              │ │   │
+│  │  │  • Detects available backends                                  │ │   │
+│  │  │  • Selects optimal based on: hardware, license, network        │ │   │
+│  │  │  • Provides unified API for all backends                       │ │   │
+│  │  └────────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                      │   │
+│  │  ┌──────────┬──────────┬──────────┬──────────┬──────────┐         │   │
+│  │  │io_uring  │   DPDK   │   QUIC   │   TCP    │  Relay   │         │   │
+│  │  │ Backend  │ Backend  │ Backend  │ Backend  │ Backend  │         │   │
+│  │  │ 8-25GB/s │ 10GB/s   │  1GB/s   │ 120MB/s  │  1GB/s   │         │   │
+│  │  └────┬─────┴────┬─────┴────┬─────┴────┬─────┴────┬─────┘         │   │
+│  └───────┼──────────┼──────────┼──────────┼──────────┼────────────────┘   │
+│          │          │          │          │          │                     │
+│  ┌───────┴──────────┴──────────┴──────────┴──────────┴────────────────┐   │
+│  │                    NETWORK LAYER (qltp-network)                      │   │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │   │
+│  │  │  Connection Management                                         │ │   │
+│  │  │  • Protocol negotiation                                        │ │   │
+│  │  │  • Error recovery & resume                                     │ │   │
+│  │  │  • Flow control & congestion                                   │ │   │
+│  │  │  • Packet loss mitigation (5 layers)                           │ │   │
+│  │  └────────────────────────────────────────────────────────────────┘ │   │
+│  └────────────────────────────┬────────────────────────────────────────┘   │
+│                               │                                             │
+│  ┌────────────────────────────┴────────────────────────────────────────┐   │
+│  │              INFRASTRUCTURE LAYER                                    │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │   │
+│  │  │   Storage    │  │     Auth     │  │  Licensing   │             │   │
+│  │  │ (qltp-storage)│ │ (qltp-auth)  │  │(qltp-licensing)│           │   │
+│  │  │              │  │              │  │              │             │   │
+│  │  │ • Content    │  │ • JWT tokens │  │ • License    │             │   │
+│  │  │   store      │  │ • Sessions   │  │   validation │             │   │
+│  │  │ • Dedup      │  │ • User mgmt  │  │ • Quotas     │             │   │
+│  │  │   engine     │  │              │  │ • Usage      │             │   │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    EXTERNAL SERVICES                                 │   │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │   │
+│  │  │  Backend Server (Cloud - Axum + PostgreSQL)                  │  │   │
+│  │  │  ┌────────────┐  ┌────────────┐  ┌────────────┐            │  │   │
+│  │  │  │    Auth    │  │  License   │  │   Usage    │            │  │   │
+│  │  │  │    API     │  │    API     │  │    API     │            │  │   │
+│  │  │  └────────────┘  └────────────┘  └────────────┘            │  │   │
+│  │  │  ┌────────────┐  ┌────────────┐  ┌────────────┐            │  │   │
+│  │  │  │  Payments  │  │   Relay    │  │    NAT     │            │  │   │
+│  │  │  │  (Stripe)  │  │  Service   │  │  Traversal │            │  │   │
+│  │  │  └────────────┘  └────────────┘  └────────────┘            │  │   │
+│  │  └──────────────────────────────────────────────────────────────┘  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow - Complete Transfer Process
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    COMPLETE FILE TRANSFER FLOW                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+SENDER SIDE                                                    RECEIVER SIDE
+─────────────────────────────────────────────────────────────────────────────
+
+1. USER INITIATES TRANSFER
+   qltp send file.bin receiver:8080
+        │
+        ↓
+2. AUTHENTICATION & LICENSE CHECK
+   ┌─────────────────────┐
+   │ Check local license │ ──────────────────┐
+   │ Validate quota      │                   │
+   └─────────────────────┘                   │
+        │                                     ↓
+        │                          ┌──────────────────────┐
+        │                          │  Backend Server      │
+        │                          │  • Verify auth token │
+        │                          │  • Check license     │
+        │                          │  • Update usage      │
+        │                          └──────────────────────┘
+        ↓
+3. FILE PROCESSING
+   ┌─────────────────────┐
+   │ Read file           │
+   │ Calculate SHA-256   │
+   └─────────────────────┘
+        │
+        ↓
+   ┌─────────────────────┐
+   │ Chunk file          │
+   │ (content-defined)   │
+   │ 64KB - 4MB chunks   │
+   └─────────────────────┘
+        │
+        ↓
+   ┌─────────────────────┐
+   │ Deduplicate         │
+   │ (check existing)    │
+   └─────────────────────┘
+        │
+        ↓
+   ┌─────────────────────┐
+   │ Compress            │
+   │ (LZ4/Zstd adaptive) │
+   └─────────────────────┘
+        │
+        ↓
+   ┌─────────────────────┐
+   │ Encrypt             │
+   │ (TLS 1.3)           │
+   └─────────────────────┘
+        │
+        ↓
+4. TRANSPORT SELECTION
+   ┌─────────────────────┐
+   │ TransportManager    │
+   │ • Detect hardware   │
+   │ • Check license     │
+   │ • Select backend    │
+   └─────────────────────┘
+        │
+        ├─→ io_uring (8-25 GB/s) ──┐
+        ├─→ DPDK (10 GB/s)         │
+        ├─→ QUIC (1 GB/s)          │
+        └─→ TCP (120 MB/s)         │
+                                    │
+5. NETWORK TRANSMISSION              │
+   ┌─────────────────────┐          │
+   │ Send chunks         │          │
+   │ • Parallel streams  │          │
+   │ • Flow control      │          │
+   │ • Error recovery    │          │
+   └─────────────────────┘          │
+        │                            │
+        │  P2P Direct Transfer       │
+        │  (8-25 GB/s)              │
+        └────────────────────────────┼──────────────────────┐
+                                     │                      │
+                                     ↓                      ↓
+                          ┌──────────────────────┐  ┌─────────────────┐
+                          │  Relay Server        │  │  RECEIVER       │
+                          │  (if NAT/firewall)   │  │                 │
+                          │  • Temporary storage │  │  1. Receive     │
+                          │  • Forward chunks    │  │  2. Decrypt     │
+                          │  • Auto-cleanup      │  │  3. Decompress  │
+                          └──────────────────────┘  │  4. Deduplicate │
+                                     │              │  5. Reassemble  │
+                                     └──────────────┤  6. Verify      │
+                                                    └─────────────────┘
+                                                             │
+6. COMPLETION & VERIFICATION                                 ↓
+   ┌─────────────────────┐                        ┌─────────────────┐
+   │ Verify transfer     │                        │ Write file      │
+   │ Update usage stats  │                        │ Calculate hash  │
+   │ Report to backend   │                        │ Confirm receipt │
+   └─────────────────────┘                        └─────────────────┘
+        │                                                  │
+        └──────────────────────────────────────────────────┘
+                                │
+                                ↓
+                     ┌──────────────────────┐
+                     │  Backend Server      │
+                     │  • Record transfer   │
+                     │  • Update quotas     │
+                     │  • Generate metrics  │
+                     └──────────────────────┘
+```
+
+### Component Interaction Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    COMPONENT INTERACTIONS                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────┐
+│   CLI App    │
+└──────┬───────┘
+       │ 1. User command
+       ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         qltp-core (Engine)                                │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  TransferPipeline                                                  │  │
+│  │  • Orchestrates entire transfer process                           │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│       │                    │                    │                         │
+│       │ 2. Chunk           │ 3. Compress        │ 4. Send                │
+│       ↓                    ↓                    ↓                         │
+│  ┌─────────┐         ┌─────────┐         ┌─────────┐                    │
+│  │Chunking │         │Compress │         │Transport│                    │
+│  │ Module  │         │ Module  │         │ Manager │                    │
+│  └────┬────┘         └────┬────┘         └────┬────┘                    │
+└───────┼──────────────────┼──────────────────┼─────────────────────────────┘
+        │                  │                  │
+        │ 5. Store         │ 6. Compress      │ 7. Select backend
+        ↓                  ↓                  ↓
+┌──────────────┐   ┌──────────────┐   ┌──────────────────────────────────┐
+│ qltp-storage │   │qltp-compress │   │     qltp-transport               │
+│              │   │              │   │  ┌────────────────────────────┐  │
+│ • Content    │   │ • LZ4        │   │  │  Backend Selection Logic   │  │
+│   store      │   │ • Zstd       │   │  │  1. Check hardware         │  │
+│ • Dedup      │   │ • Adaptive   │   │  │  2. Check license          │  │
+│   engine     │   │              │   │  │  3. Check network          │  │
+│              │   │              │   │  │  4. Select best backend    │  │
+│              │   │              │   │  └────────────────────────────┘  │
+└──────────────┘   └──────────────┘   │       │                          │
+                                       │       ↓                          │
+                                       │  ┌─────────┐  ┌─────────┐       │
+                                       │  │io_uring │  │  QUIC   │       │
+                                       │  │ Backend │  │ Backend │  ...  │
+                                       │  └─────────┘  └─────────┘       │
+                                       └──────┬───────────────────────────┘
+                                              │ 8. Send data
+                                              ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         qltp-network                                      │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  Network Layer                                                     │  │
+│  │  • Connection management                                           │  │
+│  │  • Protocol negotiation                                            │  │
+│  │  • Error recovery                                                  │  │
+│  │  • Flow control                                                    │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────┬───────────────────────────────────────────┘
+                               │ 9. Network transmission
+                               ↓
+                        ┌──────────────┐
+                        │   Network    │
+                        │  (Internet)  │
+                        └──────────────┘
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        │                      │                      │
+        ↓                      ↓                      ↓
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│   Receiver   │      │ Relay Server │      │Backend Server│
+│   (Peer)     │      │  (Optional)  │      │  (Cloud)     │
+└──────────────┘      └──────────────┘      └──────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    CROSS-CUTTING CONCERNS                                 │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                  │
+│  │   qltp-auth  │  │qltp-licensing│  │  Monitoring  │                  │
+│  │              │  │              │  │              │                  │
+│  │ • JWT tokens │  │ • License    │  │ • Metrics    │                  │
+│  │ • Sessions   │  │   validation │  │ • Logging    │                  │
+│  │ • User mgmt  │  │ • Quotas     │  │ • Tracing    │                  │
+│  │              │  │ • Usage      │  │              │                  │
+│  └──────────────┘  └──────────────┘  └──────────────┘                  │
+│         │                  │                  │                          │
+│         └──────────────────┴──────────────────┘                          │
+│                            │                                             │
+│                            ↓                                             │
+│                  ┌──────────────────┐                                    │
+│                  │  Backend Server  │                                    │
+│                  │  (PostgreSQL)    │                                    │
+│                  └──────────────────┘                                    │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### Crate Dependencies & Structure
+
+```
+qltp-project/
+│
+├── apps/
+│   └── cli/                          # User-facing CLI application
+│       ├── src/
+│       │   ├── main.rs              # Entry point, command parsing
+│       │   └── license.rs           # License commands
+│       └── Cargo.toml
+│
+├── crates/
+│   │
+│   ├── qltp-core/                   # Core transfer engine
+│   │   ├── src/
+│   │   │   ├── lib.rs               # Engine & pipeline
+│   │   │   ├── chunking.rs          # Content-defined chunking
+
+---
+
+## Domain-Driven Design + Hexagonal Architecture
+
+### Architectural Principles
+
+QLTP follows **Domain-Driven Design (DDD)** and **Hexagonal Architecture** (Ports & Adapters) principles throughout the entire system for maintainability, testability, and flexibility.
+
+### Hexagonal Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    HEXAGONAL ARCHITECTURE (PORTS & ADAPTERS)                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌─────────────────────┐
+                              │   PRIMARY PORTS     │
+                              │   (Driving Side)    │
+                              └──────────┬──────────┘
+                                         │
+                    ┌────────────────────┼────────────────────┐
+                    │                    │                    │
+            ┌───────▼────────┐  ┌────────▼────────┐  ┌───────▼────────┐
+            │   CLI Adapter  │  │   GUI Adapter   │  │  API Adapter   │
+            │   (Terminal)   │  │   (Desktop)     │  │  (REST/gRPC)   │
+            └───────┬────────┘  └────────┬────────┘  └───────┬────────┘
+                    │                    │                    │
+                    └────────────────────┼────────────────────┘
+                                         │
+                              ┌──────────▼──────────┐
+                              │                     │
+                              │   APPLICATION       │
+                              │   LAYER             │
+                              │   (Use Cases)       │
+                              │                     │
+                              └──────────┬──────────┘
+                                         │
+                              ┌──────────▼──────────┐
+                              │                     │
+                              │   DOMAIN LAYER      │
+                              │   (Business Logic)  │
+                              │   • Entities        │
+                              │   • Value Objects   │
+                              │   • Domain Services │
+                              │   • Aggregates      │
+                              │                     │
+                              └──────────┬──────────┘
+                                         │
+                              ┌──────────▼──────────┐
+                              │  SECONDARY PORTS    │
+                              │  (Driven Side)      │
+                              └──────────┬──────────┘
+                                         │
+                    ┌────────────────────┼────────────────────┐
+                    │                    │                    │
+         ┌──────────▼─────────┐  ┌──────▼──────┐  ┌─────────▼─────────┐
+         │  Storage Adapter   │  │   Network   │  │  External APIs    │
+         │  (SQLite/Postgres) │  │   Adapter   │  │  (Stripe/Auth)    │
+         └────────────────────┘  └─────────────┘  └───────────────────┘
+```
+
+### DDD Layers Applied to QLTP
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         DDD LAYERED ARCHITECTURE                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  PRESENTATION LAYER (User Interface)                                │    │
+│  │  • CLI commands (apps/cli)                                          │    │
+│  │  • GUI (future)                                                     │    │
+│  │  • REST API (future)                                                │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                   ↓                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  APPLICATION LAYER (Use Cases / Services)                           │    │
+│  │  • TransferService (orchestrates file transfers)                    │    │
+│  │  • LicenseService (manages licenses)                                │    │
+│  │  • AuthService (handles authentication)                             │    │
+│  │  • UsageTracker (tracks usage)                                      │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                   ↓                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  DOMAIN LAYER (Business Logic)                                      │    │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │    │
+│  │  │  Transfer Domain                                             │  │    │
+│  │  │  • Transfer (aggregate root)                                 │  │    │
+│  │  │  • Chunk (entity)                                            │  │    │
+│  │  │  • ChunkId (value object)                                    │  │    │
+│  │  │  • TransferStrategy (value object)                           │  │    │
+│  │  └──────────────────────────────────────────────────────────────┘  │    │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │    │
+│  │  │  License Domain                                              │  │    │
+│  │  │  • License (aggregate root)                                  │  │    │
+│  │  │  • Device (entity)                                           │  │    │
+│  │  │  • LicenseKey (value object)                                 │  │    │
+│  │  │  • LicenseTier (value object)                                │  │    │
+│  │  │  • Quota (value object)                                      │  │    │
+│  │  └──────────────────────────────────────────────────────────────┘  │    │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │    │
+│  │  │  Auth Domain                                                 │  │    │
+│  │  │  • User (aggregate root)                                     │  │    │
+│  │  │  • Session (entity)                                          │  │    │
+│  │  │  • Credentials (value object)                                │  │    │
+│  │  │  • AuthToken (value object)                                  │  │    │
+│  │  └──────────────────────────────────────────────────────────────┘  │    │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │    │
+│  │  │  Transport Domain (NEW)                                      │  │    │
+│  │  │  • TransportSession (aggregate root)                         │  │    │
+│  │  │  • TransportBackend (entity)                                 │  │    │
+│  │  │  • TransportType (value object)                              │  │    │
+│  │  │  • TransportStats (value object)                             │  │    │
+│  │  └──────────────────────────────────────────────────────────────┘  │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                   ↓                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  INFRASTRUCTURE LAYER (Technical Implementation)                    │    │
+│  │  • Storage adapters (SQLite, PostgreSQL)                            │    │
+│  │  • Network adapters (io_uring, DPDK, QUIC, TCP)                    │    │
+│  │  • External service adapters (Stripe, Auth0)                        │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Crate Structure with DDD + Hexagonal
+
+```
+crates/
+│
+├── qltp-core/                          # Application + Domain Layer
+│   ├── src/
+│   │   ├── domain/                     # DOMAIN LAYER
+│   │   │   ├── transfer.rs             # Transfer aggregate
+│   │   │   ├── chunk.rs                # Chunk entity
+│   │   │   ├── chunk_id.rs             # ChunkId value object
+│   │   │   └── transfer_strategy.rs    # Strategy value object
+│   │   │
+│   │   ├── application/                # APPLICATION LAYER
+│   │   │   ├── transfer_service.rs     # Transfer use cases
+│   │   │   ├── pipeline.rs             # Transfer pipeline
+│   │   │   └── orchestrator.rs         # Orchestration logic
+│   │   │
+│   │   ├── ports/                      # PORTS (Interfaces)
+│   │   │   ├── storage_port.rs         # Storage interface
+│   │   │   ├── transport_port.rs       # Transport interface
+│   │   │   └── compression_port.rs     # Compression interface
+│   │   │
+│   │   └── lib.rs
+│   └── Cargo.toml
+│
+├── qltp-transport/                     # Domain + Ports + Adapters
+│   ├── src/
+│   │   ├── domain/                     # DOMAIN LAYER
+│   │   │   ├── transport_session.rs    # Aggregate root
+│   │   │   ├── transport_type.rs       # Value object
+│   │   │   ├── transport_stats.rs      # Value object
+│   │   │   └── backend_capability.rs   # Value object
+│   │   │
+│   │   ├── ports/                      # PORTS (Interfaces)
+│   │   │   ├── transport_backend.rs    # TransportBackend trait
+│   │   │   └── backend_selector.rs     # Selection interface
+│   │   │
+│   │   ├── adapters/                   # ADAPTERS (Infrastructure)
+│   │   │   ├── io_uring.rs             # io_uring adapter
+│   │   │   ├── dpdk.rs                 # DPDK adapter
+│   │   │   ├── quic.rs                 # QUIC adapter
+│   │   │   └── tcp.rs                  # TCP adapter
+│   │   │
+│   │   ├── application/                # APPLICATION LAYER
+│   │   │   ├── transport_manager.rs    # Manager service
+│   │   │   └── backend_selector.rs     # Selection logic
+│   │   │
+│   │   └── lib.rs
+│   └── Cargo.toml
+│
+├── qltp-licensing/                     # Full DDD + Hexagonal
+│   ├── src/
+│   │   ├── domain/                     # DOMAIN LAYER
+│   │   │   ├── license.rs              # License aggregate
+│   │   │   ├── device.rs               # Device entity
+│   │   │   ├── license_key.rs          # LicenseKey value object
+│   │   │   ├── license_tier.rs         # Tier value object
+│   │   │   ├── quota.rs                # Quota value object
+│   │   │   └── usage_record.rs         # UsageRecord entity
+│   │   │
+│   │   ├── ports/                      # PORTS (Interfaces)
+│   │   │   ├── license_repository.rs   # Repository interface
+│   │   │   └── usage_repository.rs     # Usage interface
+│   │   │
+│   │   ├── adapters/                   # ADAPTERS (Infrastructure)
+│   │   │   ├── memory_store.rs         # In-memory adapter
+│   │   │   ├── sqlite_store.rs         # SQLite adapter
+│   │   │   └── postgres_store.rs       # PostgreSQL adapter
+│   │   │
+│   │   ├── application/                # APPLICATION LAYER
+│   │   │   ├── license_service.rs      # License use cases
+│   │   │   └── usage_tracker.rs        # Usage tracking
+│   │   │
+│   │   └── lib.rs
+│   └── Cargo.toml
+│
+├── qltp-auth/                          # Full DDD + Hexagonal
+│   ├── src/
+│   │   ├── domain/                     # DOMAIN LAYER
+│   │   │   ├── user.rs                 # User aggregate
+│   │   │   ├── session.rs              # Session entity
+│   │   │   ├── credentials.rs          # Credentials value object
+│   │   │   └── auth_token.rs           # Token value object
+│   │   │
+│   │   ├── ports/                      # PORTS (Interfaces)
+│   │   │   ├── user_repository.rs      # User repository
+│   │   │   └── token_service.rs        # Token service
+│   │   │
+│   │   ├── adapters/                   # ADAPTERS (Infrastructure)
+│   │   │   ├── jwt_token_service.rs    # JWT adapter
+│   │   │   ├── sqlite_user_repo.rs     # SQLite adapter
+│   │   │   └── postgres_user_repo.rs   # PostgreSQL adapter
+│   │   │
+│   │   ├── application/                # APPLICATION LAYER
+│   │   │   ├── auth_service.rs         # Auth use cases
+│   │   │   └── session_manager.rs      # Session management
+│   │   │
+│   │   └── lib.rs
+│   └── Cargo.toml
+│
+├── qltp-storage/                       # Ports + Adapters
+│   ├── src/
+│   │   ├── ports/                      # PORTS
+│   │   │   ├── content_store.rs        # Storage interface
+│   │   │   └── dedup_engine.rs         # Dedup interface
+│   │   │
+│   │   ├── adapters/                   # ADAPTERS
+│   │   │   ├── file_store.rs           # File system adapter
+│   │   │   ├── s3_store.rs             # S3 adapter (future)
+│   │   │   └── memory_store.rs         # In-memory adapter
+│   │   │
+│   │   └── lib.rs
+│   └── Cargo.toml
+│
+└── qltp-network/                       # Ports + Adapters
+    ├── src/
+    │   ├── ports/                      # PORTS
+    │   │   ├── connection.rs           # Connection interface
+    │   │   └── protocol.rs             # Protocol interface
+    │   │
+    │   ├── adapters/                   # ADAPTERS
+    │   │   ├── tcp_connection.rs       # TCP adapter
+    │   │   ├── quic_connection.rs      # QUIC adapter
+    │   │   └── relay_connection.rs     # Relay adapter
+    │   │
+    │   └── lib.rs
+    └── Cargo.toml
+```
+
+### Example: Transport Domain with DDD
+
+```rust
+// crates/qltp-transport/src/domain/transport_session.rs
+
+/// Transport Session - Aggregate Root
+/// Represents a complete transport session with lifecycle management
+pub struct TransportSession {
+    id: SessionId,
+    backend_type: TransportType,
+    state: SessionState,
+    stats: TransportStats,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl TransportSession {
+    /// Factory method - ensures valid creation
+    pub fn new(backend_type: TransportType) -> Result<Self> {
+        // Domain validation
+        if !backend_type.is_available() {
+            return Err(DomainError::BackendNotAvailable(backend_type));
+        }
+        
+        Ok(Self {
+            id: SessionId::generate(),
+            backend_type,
+            state: SessionState::Initializing,
+            stats: TransportStats::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+    }
+    
+    /// Domain method - encapsulates business logic
+    pub fn start(&mut self) -> Result<()> {
+        // State transition validation
+        if self.state != SessionState::Initializing {
+            return Err(DomainError::InvalidStateTransition {
+                from: self.state,
+                to: SessionState::Active,
+            });
+        }
+        
+        self.state = SessionState::Active;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+    
+    /// Domain method - business rule enforcement
+    pub fn record_transfer(&mut self, bytes: u64) -> Result<()> {
+        if self.state != SessionState::Active {
+            return Err(DomainError::SessionNotActive);
+        }
+        
+        self.stats.bytes_transferred += bytes;
+        self.stats.packets_sent += 1;
+        self.updated_at = Utc::now();
+        
+        // Domain event
+        self.raise_event(TransferRecorded { bytes });
+        
+        Ok(())
+    }
+}
+
+/// Session ID - Value Object
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId(Uuid);
+
+impl SessionId {
+    pub fn generate() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// Transport Type - Value Object
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportType {
+    IoUring,
+    Dpdk,
+    Quic,
+    Tcp,
+}
+
+impl TransportType {
+    /// Domain logic - availability check
+    pub fn is_available(&self) -> bool {
+        match self {
+            Self::IoUring => Self::check_io_uring_available(),
+            Self::Dpdk => Self::check_dpdk_available(),
+            Self::Quic => true,
+            Self::Tcp => true,
+        }
+    }
+    
+    /// Domain logic - performance characteristics
+    pub fn max_throughput(&self) -> u64 {
+        match self {
+            Self::IoUring => 8_000_000_000,  // 8 GB/s
+            Self::Dpdk => 10_000_000_000,    // 10 GB/s
+            Self::Quic => 1_000_000_000,     // 1 GB/s
+            Self::Tcp => 120_000_000,        // 120 MB/s
+        }
+    }
+}
+
+/// Session State - Value Object
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Initializing,
+    Active,
+    Paused,
+    Completed,
+    Failed,
+}
+
+/// Transport Stats - Value Object
+#[derive(Debug, Clone, Default)]
+pub struct TransportStats {
+    pub bytes_transferred: u64,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub errors: u64,
+}
+```
+
+### Example: Port Definition
+
+```rust
+// crates/qltp-transport/src/ports/transport_backend.rs
+
+/// Transport Backend Port (Interface)
+/// Defines the contract that all transport adapters must implement
+#[async_trait]
+pub trait TransportBackend: Send + Sync {
+    /// Send data chunk
+    async fn send_chunk(&mut self, chunk: &[u8], dest: &SocketAddr) -> Result<()>;
+    
+    /// Receive data chunk
+    async fn receive_chunk(&mut self, buffer: &mut [u8]) -> Result<usize>;
+    
+    /// Get backend capabilities
+    fn capabilities(&self) -> BackendCapabilities;
+    
+    /// Get current statistics
+    fn stats(&self) -> TransportStats;
+    
+    /// Check if backend is available on current system
+    fn is_available() -> bool where Self: Sized;
+}
+
+/// Backend Capabilities - Value Object
+#[derive(Debug, Clone)]
+pub struct BackendCapabilities {
+    pub max_throughput: u64,
+    pub supports_zero_copy: bool,
+    pub supports_parallel_streams: bool,
+    pub requires_special_hardware: bool,
+    pub platform_support: Vec<Platform>,
+}
+```
+
+### Example: Adapter Implementation
+
+```rust
+// crates/qltp-transport/src/adapters/io_uring.rs
+
+/// io_uring Adapter - Infrastructure Implementation
+pub struct IoUringAdapter {
+    ring: IoUring,
+    session: TransportSession,
+    buffer_pool: BufferPool,
+}
+
+impl IoUringAdapter {
+    pub fn new(session: TransportSession) -> Result<Self> {
+        // Validate domain constraints
+        if session.backend_type() != TransportType::IoUring {
+            return Err(AdapterError::InvalidBackendType);
+        }
+        
+        // Infrastructure setup
+        let ring = IoUring::builder()
+            .setup_sqpoll(1000)
+            .build(1024)?;
+        
+        let buffer_pool = BufferPool::new(65536, 1024, true)?;
+        
+        Ok(Self {
+            ring,
+            session,
+            buffer_pool,
+        })
+    }
+}
+
+#[async_trait]
+impl TransportBackend for IoUringAdapter {
+    async fn send_chunk(&mut self, chunk: &[u8], dest: &SocketAddr) -> Result<()> {
+        // Record in domain
+        self.session.record_transfer(chunk.len() as u64)?;
+        
+        // Infrastructure implementation
+        let socket_fd = self.get_socket(dest)?;
+        
+        let sqe = opcode::Send::new(
+            types::Fd(socket_fd),
+            chunk.as_ptr(),
+            chunk.len() as u32
+        ).build();
+        
+        unsafe {
+            self.ring.submission().push(&sqe)?;
+        }
+        
+        self.ring.submit_and_wait(1)?;
+        
+        Ok(())
+    }
+    
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            max_throughput: 8_000_000_000,
+            supports_zero_copy: true,
+            supports_parallel_streams: true,
+            requires_special_hardware: false,
+            platform_support: vec![Platform::Linux],
+        }
+    }
+    
+    fn stats(&self) -> TransportStats {
+        self.session.stats().clone()
+    }
+    
+    fn is_available() -> bool {
+        TransportType::IoUring.is_available()
+    }
+}
+```
+
+### Example: Application Service
+
+```rust
+// crates/qltp-transport/src/application/transport_manager.rs
+
+/// Transport Manager - Application Service
+/// Orchestrates transport operations using domain logic
+pub struct TransportManager {
+    sessions: HashMap<SessionId, Box<dyn TransportBackend>>,
+    selector: BackendSelector,
+}
+
+impl TransportManager {
+    pub fn new() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            selector: BackendSelector::new(),
+        }
+    }
+    
+    /// Use case: Create transport session
+    pub async fn create_session(
+        &mut self,
+        requirements: TransferRequirements,
+    ) -> Result<SessionId> {
+        // 1. Use domain logic to select backend
+        let backend_type = self.selector.select_optimal(requirements)?;
+        
+        // 2. Create domain aggregate
+        let mut session = TransportSession::new(backend_type)?;
+        session.start()?;
+        
+        // 3. Create infrastructure adapter
+        let adapter = self.create_adapter(session.clone())?;
+        
+        // 4. Store session
+        let session_id = session.id();
+        self.sessions.insert(session_id, adapter);
+        
+        Ok(session_id)
+    }
+    
+    /// Use case: Send data
+    pub async fn send_data(
+        &mut self,
+        session_id: SessionId,
+        data: &[u8],
+        dest: &SocketAddr,
+    ) -> Result<()> {
+        let adapter = self.sessions
+            .get_mut(&session_id)
+            .ok_or(Error::SessionNotFound)?;
+        
+        adapter.send_chunk(data, dest).await
+    }
+    
+    fn create_adapter(
+        &self,
+        session: TransportSession,
+    ) -> Result<Box<dyn TransportBackend>> {
+        match session.backend_type() {
+            TransportType::IoUring => {
+                Ok(Box::new(IoUringAdapter::new(session)?))
+            }
+            TransportType::Dpdk => {
+                Ok(Box::new(DpdkAdapter::new(session)?))
+            }
+            TransportType::Quic => {
+                Ok(Box::new(QuicAdapter::new(session)?))
+            }
+            TransportType::Tcp => {
+                Ok(Box::new(TcpAdapter::new(session)?))
+            }
+        }
+    }
+}
+```
+
+### Benefits of DDD + Hexagonal Architecture
+
+**1. Testability**
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    // Test domain logic without infrastructure
+    #[test]
+    fn test_session_state_transitions() {
+        let mut session = TransportSession::new(TransportType::Tcp).unwrap();
+        assert_eq!(session.state(), SessionState::Initializing);
+        
+        session.start().unwrap();
+        assert_eq!(session.state(), SessionState::Active);
+        
+        // Invalid transition should fail
+        assert!(session.start().is_err());
+    }
+    
+    // Test with mock adapter
+    #[tokio::test]
+    async fn test_transfer_with_mock() {
+        let session = TransportSession::new(TransportType::Tcp).unwrap();
+        let mut adapter = MockTransportAdapter::new(session);
+        
+        adapter.send_chunk(b"test", &"127.0.0.1:8080".parse().unwrap()).await.unwrap();
+        
+        assert_eq!(adapter.stats().bytes_transferred, 4);
+    }
+}
+```
+
+**2. Flexibility**
+- Easy to swap implementations (SQLite → PostgreSQL)
+- Easy to add new backends (io_uring, DPDK)
+- Easy to mock for testing
+
+**3. Maintainability**
+- Clear separation of concerns
+- Domain logic isolated from infrastructure
+- Business rules in one place
+
+**4. Scalability**
+- Independent deployment of layers
+- Easy to add new features
+- Clear boundaries between components
+
+│   │   │   ├── compression.rs       # Adaptive compression
+│   │   │   ├── adaptive.rs          # Adaptive algorithms
+│   │   │   ├── prefetch.rs          # Predictive pre-fetching
+│   │   │   └── pipeline.rs          # Transfer orchestration
+│   │   └── Cargo.toml
+│   │       Dependencies: qltp-storage, qltp-compression, qltp-transport
+│   │
+│   ├── qltp-transport/              # NEW - Transport abstraction
+│   │   ├── src/
+│   │   │   ├── lib.rs               # TransportBackend trait
+│   │   │   ├── manager.rs           # TransportManager
+│   │   │   ├── selector.rs          # Backend selection
+│   │   │   ├── io_uring.rs          # io_uring backend
+│   │   │   ├── dpdk.rs              # DPDK backend
+│   │   │   ├── quic.rs              # QUIC backend
+│   │   │   ├── tcp.rs               # TCP backend
+│   │   │   └── stats.rs             # Performance metrics
+│   │   └── Cargo.toml
+│   │       Dependencies: io-uring, dpdk-sys (optional), quinn
+│   │
+│   ├── qltp-network/                # Network layer
+│   │   ├── src/
+│   │   │   ├── lib.rs               # Network abstractions
+│   │   │   ├── connection.rs        # Connection management
+│   │   │   ├── protocol.rs          # Protocol definitions
+│   │   │   ├── quic.rs              # QUIC implementation
+│   │   │   ├── resume.rs            # Resume capability
+│   │   │   └── parallel.rs          # Parallel streams
+│   │   └── Cargo.toml
+│   │       Dependencies: quinn, tokio, rustls
+│   │
+│   ├── qltp-storage/                # Storage layer
+│   │   ├── src/
+│   │   │   └── lib.rs               # Content store, dedup
+│   │   └── Cargo.toml
+│   │
+│   ├── qltp-compression/            # Compression layer
+│   │   ├── src/
+│   │   │   └── lib.rs               # LZ4, Zstd
+│   │   └── Cargo.toml
+│   │
+│   ├── qltp-auth/                   # Authentication
+│   │   ├── src/
+│   │   │   └── lib.rs               # JWT, sessions, users
+│   │   └── Cargo.toml
+│   │
+│   └── qltp-licensing/              # Licensing & quotas
+│       ├── src/
+│       │   ├── lib.rs               # License management
+│       │   ├── domain/              # DDD entities
+│       │   ├── ports/               # Hexagonal ports
+│       │   ├── adapters/            # Infrastructure adapters
+│       │   └── integration/         # Auth-license integration
+│       └── Cargo.toml
+│
+└── docs/
+    ├── ENTERPRISE_ARCHITECTURE.md   # This document
+    ├── SYSTEM_ARCHITECTURE.md       # Original architecture
+    ├── PACKET_LOSS_MITIGATION.md    # Reliability design
+    └── ...
+```
+
+### Technology Stack Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         TECHNOLOGY STACK                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  LANGUAGE & RUNTIME                                                          │
+│  • Rust 1.70+                    (Memory safety, performance)               │
+│  • Tokio                         (Async runtime)                            │
+│                                                                              │
+│  TRANSPORT LAYER                                                             │
+│  • io_uring                      (Linux kernel bypass, 8-25 GB/s)           │
+│  • DPDK                          (Userspace networking, 10 GB/s)            │
+│  • Quinn (QUIC)                  (Modern UDP protocol, 1 GB/s)              │
+│  • Tokio TCP                     (Standard TCP, 120 MB/s)                   │
+│                                                                              │
+│  COMPRESSION                                                                 │
+│  • LZ4                           (Fast compression)                         │
+│  • Zstd                          (High compression ratio)                   │
+│                                                                              │
+│  SECURITY                                                                    │
+│  • Rustls (TLS 1.3)              (Encryption)                               │
+│  • SHA-256                       (Integrity verification)                   │
+│  • JWT                           (Authentication tokens)                    │
+│                                                                              │
+│  STORAGE                                                                     │
+│  • Content-addressable store     (Deduplication)                            │
+│  • SQLite                        (Local persistence)                        │
+│  • PostgreSQL                    (Backend database)                         │
+│                                                                              │
+│  BACKEND SERVER                                                              │
+│  • Axum                          (Web framework)                            │
+│  • PostgreSQL                    (Database)                                 │
+│  • Stripe                        (Payments)                                 │
+│                                                                              │
+│  DEPLOYMENT                                                                  │
+│  • Docker                        (Containerization)                         │
+│  • Kubernetes                    (Orchestration)                            │
+│  • AWS/GCP/Azure                 (Cloud platforms)                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+
+| Scenario | Network | Backend | Speed | Latency | Use Case |
+|----------|---------|---------|-------|---------|----------|
+| **Local P2P** | LAN | io_uring/DPDK | 10 GB/s | <1ms | Office file sharing |
+| **Remote P2P** | Internet | io_uring | 8 GB/s | 10-100ms | Cross-office transfers |
+| **Cloud-to-Cloud** | AWS/GCP | io_uring | 25 GB/s | 5-50ms | Data center replication |
+| **Hybrid** | Mixed | Adaptive | 1-10 GB/s | Variable | Multi-cloud workflows |
+
+### Cloud-to-Cloud Deployment Benefits
+
+When deploying QLTP apps in cloud environments:
+
+**Performance Advantages**:
+- ✅ **Higher bandwidth**: 25-200 Gbps inter-region links
+- ✅ **Lower latency**: Optimized cloud backbone networks
+- ✅ **Better reliability**: Enterprise-grade infrastructure
+- ✅ **Auto-scaling**: Handle burst traffic automatically
+
+**Example Cloud Deployment**:
+```
+AWS us-east-1 (QLTP App)
+    ↓ 25 Gbps AWS backbone
+AWS eu-west-1 (QLTP App)
+    ↓ 100 Gbps intra-region
+AWS eu-west-1 (Another QLTP App)
+
+Transfer Speed: 25 GB/s (200 Gbps)
+1GB file: 0.04 seconds
+100GB file: 4 seconds
+1TB dataset: 40 seconds
+```
+
+**Cloud Provider Support**:
+- **AWS**: EC2 with Enhanced Networking (25-200 Gbps)
+- **Google Cloud**: Compute Engine with gVNIC (100 Gbps)
+- **Azure**: Accelerated Networking (40-200 Gbps)
+- **All support**: Linux 5.1+ with io_uring
+
+┌─────────────────────────────────────────────────────────────────┐
+│ Scenario 2: Remote P2P (Over Internet, Different Networks)      │
+│                                                                  │
+│  Device A ◄────Internet 8GB/s────► Device B                     │
+│  (New York)                        (London)                     │
+│     │                                  │                         │
+│     └──────► Backend (Auth) ◄──────────┘                        │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│ Scenario 3: Cloud-to-Cloud (Apps Deployed in Cloud)             │
+│                                                                  │
+│  QLTP App A ◄────Cloud Network 25GB/s────► QLTP App B          │
+│  (AWS us-east-1)                           (AWS eu-west-1)      │
+│     │                                          │                 │
+│     └──────► Backend (Auth/Metrics) ◄──────────┘                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Insights**:
+- ✅ Files transfer **directly** between endpoints (never through backend)
+- ✅ Backend only handles **metadata** (auth, licensing, usage tracking)
+- ✅ Works across **any network topology** (LAN, WAN, Cloud)
+- ✅ Automatic **speed optimization** based on deployment scenario
+
+---
+
+## Transport Layer Architecture
+
+### Core Trait Design
+
+```rust
+// crates/qltp-transport/src/lib.rs
+
+#[async_trait]
+pub trait TransportBackend: Send + Sync {
+    async fn send_chunk(&mut self, chunk: &[u8], dest: &SocketAddr) -> Result<()>;
+    async fn receive_chunk(&mut self, buffer: &mut [u8]) -> Result<usize>;
+    fn max_throughput(&self) -> u64;
+    fn get_stats(&self) -> TransportStats;
+    fn is_available() -> bool where Self: Sized;
+    fn priority() -> u8 where Self: Sized;
+}
+
+pub enum TransportType {
+    IoUring,   // 8-25 GB/s - Enterprise/Professional (standard NICs)
+    Quic,      // 1 GB/s    - Standard
+    Tcp,       // 120 MB/s  - Basic
+    Dpdk,      // 10 GB/s   - Optional (requires special hardware)
+}
+
+pub struct TransportManager {
+    backends: Vec<Box<dyn TransportBackend>>,
+    active_backend: Option<TransportType>,
+}
+
+impl TransportManager {
+    pub fn new() -> Self {
+        let mut backends = Vec::new();
+        
+        // Priority 1: io_uring (works with standard NICs)
+        #[cfg(target_os = "linux")]
+        if IoUringBackend::is_available() {
+            backends.push(Box::new(IoUringBackend::new().unwrap()));
+        }
+        
+        // Priority 2: QUIC Enhanced (cross-platform)
+        backends.push(Box::new(QuicBackend::new()));
+        
+        // Priority 3: TCP (universal fallback)
+        backends.push(Box::new(TcpBackend::new()));
+        
+        // Optional: DPDK (only if explicitly enabled and hardware available)
+        #[cfg(feature = "dpdk")]
+        if DpdkBackend::is_available() {
+            backends.push(Box::new(DpdkBackend::new().unwrap()));
+        }
+        
+        Self { backends, active_backend: None }
+    }
+    
+    pub async fn select_best_backend(
+        &mut self,
+        requirements: &TransferRequirements,
+    ) -> Result<TransportType> {
+        for backend in &self.backends {
+            if backend.max_throughput() >= requirements.min_speed &&
+               self.meets_license_requirements(backend, requirements) {
+                return Ok(backend.backend_type());
+            }
+        }
+        Ok(TransportType::Tcp) // Fallback
+    }
+}
+```
+
+### Backend Selection Algorithm
+
+```rust
+pub struct BackendSelector {
+    performance_cache: HashMap<TransportType, PerformanceMetrics>,
+}
+
+impl BackendSelector {
+    fn calculate_score(&self, backend: TransportType, requirements: &TransferRequirements) -> f64 {
+        let mut score = 0.0;
+        
+        // Performance weight (40%)
+        let max_throughput = self.get_max_throughput(backend);
+        let performance_score = (max_throughput as f64 / requirements.min_speed as f64).min(1.0);
+        score += performance_score * 0.4;
+        
+        // Reliability weight (30%)
+        score += self.get_reliability_score(backend) * 0.3;
+        
+        // Resource usage weight (20%)
+        score += (1.0 - self.get_resource_usage_score(backend)) * 0.2;
+        
+        // User preference weight (10%)
+        score += self.get_user_preference_score(backend) * 0.1;
+        
+        score
+    }
+}
+```
+
+---
+
+## Backend Implementations
+
+### 1. io_uring Backend (8 GB/s)
+
+**Target**: Linux 5.1+ with kernel bypass
+
+```rust
+// crates/qltp-transport/src/io_uring.rs
+
+#[cfg(target_os = "linux")]
+pub struct IoUringBackend {
+    ring: IoUring,
+    buffer_pool: BufferPool,
+    stats: Arc<Mutex<TransportStats>>,
+}
+
+impl IoUringBackend {
+    pub fn new() -> Result<Self> {
+        // Check kernel version
+        let version = Self::get_kernel_version()?;
+        if version < (5, 1, 0) {
+            return Err(Error::NotSupported("Requires Linux 5.1+"));
+        }
+        
+        // Create io_uring with optimized settings
+        let ring = IoUring::builder()
+            .setup_sqpoll(1000)      // Kernel polling
+            .setup_iopoll()          // Hardware polling
+            .build(1024)?;
+        
+        // Buffer pool with huge pages (2MB)
+        let buffer_pool = BufferPool::new(65536, 1024, true)?;
+        
+        Ok(Self { ring, buffer_pool, stats: Default::default() })
+    }
+    
+    pub fn is_available() -> bool {
+        Self::get_kernel_version()
+            .map(|v| v >= (5, 1, 0))
+            .unwrap_or(false)
+    }
+}
+
+#[async_trait]
+impl TransportBackend for IoUringBackend {
+    async fn send_chunk(&mut self, chunk: &[u8], dest: &SocketAddr) -> Result<()> {
+        let socket_fd = self.get_or_create_socket(dest)?;
+        
+        // Zero-copy send using io_uring
+        let sqe = opcode::Send::new(
+            types::Fd(socket_fd),
+            chunk.as_ptr(),
+            chunk.len() as u32
+        ).build();
+        
+        unsafe { self.ring.submission().push(&sqe)?; }
+        self.ring.submit_and_wait(1)?;
+        
+        let mut stats = self.stats.lock().await;
+        stats.bytes_sent += chunk.len() as u64;
+        
+        Ok(())
+    }
+    
+    fn max_throughput(&self) -> u64 { 8_000_000_000 }
+    fn priority() -> u8 { 90 }
+}
+```
+
+**Key Features**:
+- Zero-copy data path
+- Kernel bypass (no system calls)
+- Huge page memory (2MB pages)
+- Hardware polling for NVMe/network
+- 8 GB/s throughput
+
+### 2. DPDK Backend (10 GB/s)
+
+**Target**: Enterprise data centers with special NICs
+
+```rust
+// crates/qltp-transport/src/dpdk.rs
+
+#[cfg(feature = "dpdk")]
+pub struct DpdkBackend {
+    port_id: u16,
+    mempool: *mut rte_mempool,
+    config: DpdkConfig,
+}
+
+impl DpdkBackend {
+    pub fn new() -> Result<Self> {
+        // Initialize DPDK EAL
+        let args = vec![
+            CString::new("qltp").unwrap(),
+            CString::new("-c").unwrap(),
+            CString::new("0xf").unwrap(),  // 4 CPU cores
+            CString::new("-n").unwrap(),
+            CString::new("4").unwrap(),    // 4 memory channels
+        ];
+        
+        unsafe {
+            let ret = rte_eal_init(args.len() as i32, args.as_ptr());
+            if ret < 0 {
+                return Err(Error::DpdkInit("EAL init failed"));
+            }
+        }
+        
+        // Create memory pool
+        let mempool = unsafe {
+            rte_pktmbuf_pool_create(
+                b"mbuf_pool\0".as_ptr() as *const i8,
+                8192,  // Number of mbufs
+                256,   // Cache size
+                0,     // Private data
+                2048,  // Data room
+                rte_socket_id() as i32,
+            )
+        };
+        
+        // Configure network port
+        Self::configure_port(0, mempool)?;
+        
+        Ok(Self { port_id: 0, mempool, config: Default::default() })
+    }
+    
+    pub fn is_available() -> bool {
+        std::env::var("RTE_SDK").is_ok() &&
+        std::path::Path::new("/dev/uio0").exists()
+    }
+}
+
+#[async_trait]
+impl TransportBackend for DpdkBackend {
+    async fn send_chunk(&mut self, chunk: &[u8], _dest: &SocketAddr) -> Result<()> {
+        // Allocate mbuf
+        let mbuf = unsafe { rte_pktmbuf_alloc(self.mempool) };
+        if mbuf.is_null() {
+            return Err(Error::OutOfMemory);
+        }
+        
+        // Copy data to mbuf
+        unsafe {
+            let data_ptr = rte_pktmbuf_mtod(mbuf, *mut u8);
+            std::ptr::copy_nonoverlapping(chunk.as_ptr(), data_ptr, chunk.len());
+            (*mbuf).data_len = chunk.len() as u16;
+        }
+        
+        // Send packet burst
+        let sent = unsafe {
+            rte_eth_tx_burst(self.port_id, 0, &mbuf, 1)
+        };
+        
+        if sent != 1 {
+            unsafe { rte_pktmbuf_free(mbuf); }
+            return Err(Error::SendFailed);
+        }
+        
+        Ok(())
+    }
+    
+    fn max_throughput(&self) -> u64 { 10_000_000_000 }
+    fn priority() -> u8 { 100 }
+}
+```
+
+**Key Features**:
+- Userspace networking (complete kernel bypass)
+- Direct NIC access via UIO/VFIO
+- Packet burst processing
+- 10 GB/s throughput
+- Requires dedicated CPU cores
+
+### 3. Enhanced QUIC Backend (1 GB/s)
+
+**Target**: All platforms with parallel streams
+
+```rust
+// crates/qltp-transport/src/quic_enhanced.rs
+
+pub struct QuicEnhancedBackend {
+    connection: Option<Connection>,
+    streams: Vec<SendStream>,
+    config: QuicEnhancedConfig,
+}
+
+impl QuicEnhancedBackend {
+    pub fn new() -> Self {
+        Self {
+            connection: None,
+            streams: Vec::new(),
+            config: QuicEnhancedConfig {
+                parallel_streams: 10,  // 10 parallel streams
+                initial_window: 10 * 1024 * 1024,
+                enable_0rtt: true,
+                ..Default::default()
+            },
+        }
+    }
+    
+    async fn setup_parallel_streams(&mut self) -> Result<()> {
+        let connection = self.connection.as_ref().ok_or(Error::NoConnection)?;
+        
+        for _ in 0..self.config.parallel_streams {
+            let (send_stream, _) = connection.open_bi().await?;
+            self.streams.push(send_stream);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TransportBackend for QuicEnhancedBackend {
+    async fn send_chunk(&mut self, chunk: &[u8], dest: &SocketAddr) -> Result<()> {
+        if self.streams.is_empty() {
+            self.connect(dest).await?;
+            self.setup_parallel_streams().await?;
+        }
+        
+        // Round-robin across streams
+        let stream_idx = (self.packets_sent % 10) as usize;
+        self.streams[stream_idx].write_all(chunk).await?;
+        
+        Ok(())
+    }
+    
+    fn max_throughput(&self) -> u64 { 1_000_000_000 }
+    fn priority() -> u8 { 70 }
+}
+```
+
+**Key Features**:
+- 10 parallel QUIC streams
+- 0-RTT connection establishment
+- Multiplexing without head-of-line blocking
+- 1 GB/s throughput
+- Cross-platform
+
+---
+
+## Integration with Existing QLTP
+
+### Modify qltp-core Pipeline
+
+```rust
+// crates/qltp-core/src/pipeline.rs
+
+use qltp_transport::{TransportManager, TransferRequirements};
+
+pub struct TransferPipeline {
+    storage: Arc<Mutex<ContentStore>>,
+    transport: TransportManager,  // NEW
+}
+
+impl TransferPipeline {
+    pub async fn new(storage_dir: impl AsRef<Path>) -> Result<Self> {
+        let storage = ContentStore::new(&storage_dir).await?;
+        let transport = TransportManager::new();  // NEW
+        
+        Ok(Self { storage, transport })
+    }
+    
+    pub async fn execute(&self, source: impl AsRef<Path>, strategy: TransferStrategy) -> Result<TransferResult> {
+        // Select optimal backend
+        let backend_type = self.transport.select_best_backend(&TransferRequirements {
+            min_speed: strategy.target_speed,
+            file_size: get_file_size(&source)?,
+            license_tier: strategy.license_tier,
+            network_conditions: self.detect_network_conditions().await?,
+        }).await?;
+        
+        info!("Selected transport backend: {:?}", backend_type);
+        
+        // Existing chunking, compression, dedup logic...
+        let chunks = self.chunk_file(source, &strategy).await?;
+        
+        // Send chunks using selected backend
+        for chunk in chunks {
+            self.transport.send_chunk(&chunk.data, &strategy.destination).await?;
+        }
+        
+        Ok(result)
+    }
+}
+```
+
+### Update CLI Commands
+
+```rust
+// apps/cli/src/main.rs
+
+#[derive(Subcommand)]
+enum Commands {
+    Send {
+        source: PathBuf,
+        server: String,
+        
+        /// Force specific backend
+        #[arg(long)]
+        backend: Option<String>,  // "io_uring", "dpdk", "quic", "tcp"
+        
+        /// Show available backends
+        #[arg(long)]
+        list_backends: bool,
+    },
+}
+
+async fn handle_send(args: SendArgs) -> Result<()> {
+    if args.list_backends {
+        let manager = TransportManager::new();
+        println!("Available backends:");
+        for backend in manager.available_backends() {
+            println!("  - {:?}: {} MB/s", backend, backend.max_throughput() / 1_000_000);
+        }
+        return Ok(());
+    }
+    
+    let engine = Engine::new().await?;
+    let result = engine.transfer_file(&args.source, &args.server, options).await?;
+    
+    println!("Transfer complete!");
+    println!("  Backend: {:?}", result.backend_used);
+    println!("  Speed: {:.2} GB/s", result.effective_speed_gbps());
+    println!("  Time: {:?}", result.duration);
+    
+    Ok(())
+}
+```
+
+---
+
+## Implementation Roadmap
+
+### Phase 4A: Transport Abstraction (2 weeks)
+
+**Deliverables**:
+```
+crates/qltp-transport/
+├── src/
+│   ├── lib.rs              # Transport trait & manager
+│   ├── tcp.rs              # Standard TCP backend
+│   ├── quic_enhanced.rs    # Enhanced QUIC
+│   ├── selector.rs         # Backend selection
+│   └── stats.rs            # Performance metrics
+└── Cargo.toml
+```
+
+**Tasks**:
+- [ ] Define TransportBackend trait
+- [ ] Implement TransportManager
+- [ ] Create backend selection algorithm
+- [ ] Add performance metrics
+- [ ] Write unit tests
+
+### Phase 4B: io_uring Implementation (3 weeks)
+
+**Deliverables**:
+- [ ] Linux kernel version detection
+- [ ] io_uring ring setup
+- [ ] Zero-copy send/receive
+- [ ] Huge page memory allocation
+- [ ] Performance benchmarking (target: 8 GB/s)
+- [ ] Integration tests
+
+**Dependencies**:
+```toml
+[dependencies]
+io-uring = "0.6"
+nix = "0.27"
+socket2 = "0.5"
+```
+
+### Phase 4C: DPDK Integration (Optional - 4 weeks)
+
+**Status**: Optional feature for customers with special requirements
+
+**When to Use DPDK**:
+- Customer already has DPDK-compatible infrastructure
+- Need for specialized packet processing beyond file transfer
+- Existing DPDK expertise in organization
+- Specific hardware already deployed
+
+**When to Use io_uring Instead**:
+- Standard hardware deployment (most common)
+- Cost-sensitive projects
+- Simpler operational requirements
+- Cloud deployments (AWS/GCP/Azure)
+
+**Deliverables**:
+- [ ] DPDK EAL initialization
+- [ ] Memory pool management
+- [ ] Network port configuration
+- [ ] Packet burst processing
+- [ ] CPU core affinity optimization
+- [ ] Enterprise license validation
+- [ ] Performance benchmarking vs io_uring
+
+**Hardware Requirements**:
+- Intel 82599ES or compatible DPDK NIC ($2,000+)
+- 8 CPU cores dedicated to DPDK
+- 16GB RAM with huge pages configured
+- Linux with IOMMU support
+- Network configuration expertise
+
+**Dependencies**:
+```toml
+[dependencies]
+dpdk-sys = "0.1"  # DPDK bindings
+libnuma = "0.1"   # NUMA support
+```
+
+**Note**: Both io_uring and DPDK will be available in the codebase. The system will automatically select the best available backend based on hardware and configuration.
+
+### Phase 4D: Cloud Relay Service (3 weeks)
+
+**Deliverables**:
+- [ ] Axum-based relay server
+- [ ] Connection broker API
+- [ ] NAT traversal (STUN/TURN)
+- [ ] Usage-based billing
+- [ ] Auto-scaling infrastructure
+
+---
+
+## Performance Benchmarks
+
+### Expected Results
+
+| Backend | 1GB Transfer | 10GB Transfer | 100GB Transfer | CPU Usage |
+|---------|--------------|---------------|----------------|-----------|
+| **DPDK** | 0.1s | 1.0s | 10s | 400% (4 cores) |
+| **io_uring** | 0.125s | 1.25s | 12.5s | 50% |
+| **QUIC Enhanced** | 1.0s | 10s | 100s | 25% |
+| **TCP Standard** | 8.3s | 83s | 830s | 15% |
+
+### Benchmark Suite
+
+```rust
+// benches/transport_benchmark.rs
+
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+
+fn benchmark_1gb_transfer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("1gb_transfer");
+    
+    group.bench_function("tcp", |b| {
+        b.iter(|| transfer_1gb(black_box(TransportType::Tcp)))
+    });
+    
+    group.bench_function("quic", |b| {
+        b.iter(|| transfer_1gb(black_box(TransportType::Quic)))
+    });
+    
+    #[cfg(target_os = "linux")]
+    group.bench_function("io_uring", |b| {
+        b.iter(|| transfer_1gb(black_box(TransportType::IoUring)))
+    });
+    
+    #[cfg(feature = "dpdk")]
+    group.bench_function("dpdk", |b| {
+        b.iter(|| transfer_1gb(black_box(TransportType::Dpdk)))
+    });
+}
+
+criterion_group!(benches, benchmark_1gb_transfer);
+criterion_main!(benches);
+```
+
+---
+
+## Deployment Architecture
+
+### Docker Images
+
+```dockerfile
+# Dockerfile.io_uring
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    liburing-dev \
+    libnuma-dev
+
+COPY target/release/qltp /usr/local/bin/
+COPY target/release/qltp-relay /usr/local/bin/
+
+# Configure huge pages
+RUN echo 'vm.nr_hugepages = 512' >> /etc/sysctl.conf
+
+EXPOSE 8080
+CMD ["qltp-relay", "--backend", "io_uring"]
+```
+
+### Kubernetes Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qltp-relay-io-uring
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: qltp-relay
+        image: qltp/relay:io_uring-latest
+        resources:
+          requests:
+            cpu: 1
+            memory: 2Gi
+          limits:
+            cpu: 2
+            memory: 4Gi
+        env:
+        - name: TRANSPORT_BACKEND
+          value: "io_uring"
+        securityContext:
+          capabilities:
+            add:
+            - SYS_ADMIN
+        volumeMounts:
+        - name: hugepages
+          mountPath: /dev/hugepages
+      volumes:
+      - name: hugepages
+        emptyDir:
+          medium: HugePages-2Mi
+      nodeSelector:
+        kernel-version: ">=5.1"
+```
+
+---
+
+## Business Impact
+
+### Performance Comparison
+
+| Scenario | Standard TCP | QLTP io_uring | Improvement |
+|----------|--------------|---------------|-------------|
+| 1GB file | 8.3 seconds | 0.125 seconds | **66x faster** |
+| 10GB file | 83 seconds | 1.25 seconds | **66x faster** |
+| 100GB file | 14 minutes | 12.5 seconds | **66x faster** |
+| 1TB dataset | 2.3 hours | 2.1 minutes | **66x faster** |
+
+### Cost Analysis
+
+**Traditional Solutions**:
+- Aspera: $10,000/year + $2/GB
+- Signiant: $15,000/year + $1.50/GB
+- AWS DataSync: $0.0125/GB
+
+**QLTP Enterprise**:
+- License: $2,000/year (unlimited)
+- Cloud relay: $0.09/GB (only when P2P fails)
+- Hardware: $200 (10GbE NIC, one-time)
+
+**ROI**: 80% cost savings for >100TB/year
+
+---
+
+## Conclusion
+
+This enterprise architecture enables QLTP to achieve **8,000-10,000 MB/s** transfer speeds through:
+
+1. **Flexible Transport Layer**: Runtime backend selection (DPDK → io_uring → QUIC → TCP)
+2. **Kernel Bypass**: Zero-copy data path with io_uring and DPDK
+3. **P2P Architecture**: Direct transfers without cloud bottlenecks
+4. **Cross-Platform**: Graceful degradation across all operating systems
+5. **License Integration**: Performance tiers aligned with business model
+
+**Next Steps**: Begin Phase 4A implementation (Transport Abstraction Layer)
+
+---
+
+*Made with Bob - Enterprise Architecture for QLTP*

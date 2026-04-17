@@ -1,0 +1,56 @@
+[package]
+name = "qltp-licensing"
+version = "0.1.0"
+edition = "2021"
+authors = ["QLTP Team"]
+description = "Licensing and access control for QLTP"
+license = "MIT"
+
+[dependencies]
+# Authentication
+qltp-auth = { path = "../qltp-auth" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cryptography
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+rand = "0.8"
+base64 = "0.21"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# System info
+hostname = "0.3"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Database (optional)
+rusqlite = { version = "0.30", features = ["bundled"], optional = true }
+
+# Async support (optional)
+tokio = { version = "1.35", features = ["sync", "time"], optional = true }
+async-trait = "0.1"
+
+# Logging
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.8"
+tokio = { version = "1.35", features = ["full"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "sqlite_benchmarks"
+harness = false
+
+[features]
+default = ["sqlite"]
+sqlite = ["rusqlite"]
+async = ["tokio"]
