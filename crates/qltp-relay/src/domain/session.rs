@@ -123,6 +123,17 @@ pub struct Session {
     connection_attempts: u32,
     /// Error message (if failed)
     error_message: Option<String>,
+    /// Optimistic-concurrency version stamp.
+    ///
+    /// Incremented on every real state mutation (anything that calls
+    /// `update_activity`). Used by `SessionRepository::update_if_unchanged`
+    /// to detect lost updates from concurrent writers (`AcceptSession`
+    /// retries, dual signaling paths, etc.).
+    ///
+    /// `serde(default)` keeps deserialization compatible with sessions that
+    /// were persisted before this field existed; they load with version 0.
+    #[serde(default)]
+    version: u64,
 }
 
 impl Session {
@@ -145,7 +156,13 @@ impl Session {
             bytes_transferred: 0,
             connection_attempts: 0,
             error_message: None,
+            version: 0,
         }
+    }
+
+    /// Get the current OCC version stamp.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Get session ID
@@ -249,12 +266,18 @@ impl Session {
         }
     }
 
-    /// Check if session has timed out
+    /// Check if session has timed out.
+    ///
+    /// CORRECTNESS: a previous version returned `false` when
+    /// `SystemTime::elapsed()` failed (the system clock had moved back
+    /// past `last_activity`), which let suspicious sessions outlive
+    /// their timeout indefinitely after a clock adjustment. We now
+    /// treat a backwards-clock condition as timed-out so the cleanup
+    /// path can evict the session.
     pub fn is_timed_out(&self, timeout: Duration) -> bool {
-        if let Ok(elapsed) = self.last_activity.elapsed() {
-            elapsed > timeout
-        } else {
-            false
+        match self.last_activity.elapsed() {
+            Ok(elapsed) => elapsed > timeout,
+            Err(_) => true,
         }
     }
 
@@ -271,6 +294,16 @@ impl Session {
 
     /// Add initiator ICE candidate
     pub fn add_initiator_candidate(&mut self, candidate: IceCandidate) {
+        // SECURITY: cap the ICE-candidate list per side. Without a cap,
+        // a hostile signaling peer can shovel arbitrary candidate blobs
+        // into a session indefinitely — RAM grows linearly with attacker
+        // input and every later `contains` check costs O(n). 256 is far
+        // above any realistic dual-stack-multi-interface client; real
+        // browsers gather <30. Beyond it we silently drop new arrivals.
+        const MAX_CANDIDATES_PER_SIDE: usize = 256;
+        if self.initiator_candidates.len() >= MAX_CANDIDATES_PER_SIDE {
+            return;
+        }
         if !self.initiator_candidates.contains(&candidate) {
             self.initiator_candidates.push(candidate);
             self.update_activity();
@@ -279,6 +312,10 @@ impl Session {
 
     /// Add responder ICE candidate
     pub fn add_responder_candidate(&mut self, candidate: IceCandidate) {
+        const MAX_CANDIDATES_PER_SIDE: usize = 256;
+        if self.responder_candidates.len() >= MAX_CANDIDATES_PER_SIDE {
+            return;
+        }
         if !self.responder_candidates.contains(&candidate) {
             self.responder_candidates.push(candidate);
             self.update_activity();
@@ -349,9 +386,17 @@ impl Session {
         self.update_activity();
     }
 
-    /// Update last activity timestamp
+    /// Update last activity timestamp.
+    ///
+    /// Also bumps the OCC version. This is the single chokepoint for state
+    /// mutations: every state-changing method on `Session` routes through
+    /// here (directly or via the if-gated transitions), so the version stamp
+    /// is updated exactly when state really changes. Calling a no-op
+    /// transition (e.g. `start_gathering` on an already-gathering session)
+    /// does NOT bump the version, which keeps OCC retries idempotent.
     pub fn update_activity(&mut self) {
         self.last_activity = SystemTime::now();
+        self.version = self.version.wrapping_add(1);
     }
 
     /// Add bytes transferred

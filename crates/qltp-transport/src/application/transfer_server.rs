@@ -6,12 +6,54 @@ use crate::protocol::{
     ChunkAckMessage, ErrorCode, Message, TransferAckMessage, TransferCompleteMessage,
 };
 use crate::protocol::types::{TransferConfig, TransferStats};
-use std::path::Path;
+use std::path::{Component, Path};
 use std::time::Instant;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info};
 use uuid::Uuid;
+
+/// Hard cap on the number of chunks a single transfer may declare.
+///
+/// SECURITY (CWE-770): the wire format carries `total_chunks: u32`, so a
+/// hostile peer can declare `u32::MAX` and force the receive loop to
+/// iterate ~4 billion times before terminating, monopolising the
+/// connection. Any legitimate transfer fits comfortably under this cap
+/// (10 M chunks * 1 MiB minimum chunk == 10 TiB).
+const MAX_TOTAL_CHUNKS: u32 = 10_000_000;
+
+/// Sanitise a peer-supplied file name into a single safe path component.
+///
+/// SECURITY (CWE-22 path traversal): `TransferStartMessage::file_name`
+/// is attacker-controlled. Joining it directly onto `output_dir` lets
+/// the peer escape the destination via `..`, absolute paths, drive
+/// letters, or NUL bytes (e.g. `..\..\Windows\System32\evil.dll`).
+/// We require the value to parse as exactly one `Component::Normal`
+/// segment with no NULs and no separators.
+fn sanitize_file_name(raw: &str) -> Result<&str> {
+    if raw.is_empty() {
+        return Err(Error::Protocol("Empty file name in TRANSFER_START".into()));
+    }
+    if raw.contains('\0') {
+        return Err(Error::Protocol("NUL byte in file name".into()));
+    }
+    let path = Path::new(raw);
+    let mut comps = path.components();
+    let first = comps
+        .next()
+        .ok_or_else(|| Error::Protocol("Invalid file name".into()))?;
+    if comps.next().is_some() {
+        return Err(Error::Protocol("File name must not contain path separators".into()));
+    }
+    match first {
+        Component::Normal(name) => name
+            .to_str()
+            .ok_or_else(|| Error::Protocol("File name is not valid UTF-8".into())),
+        _ => Err(Error::Protocol(
+            "File name must be a single normal component (no '..', '/', drive letters)".into(),
+        )),
+    }
+}
 
 /// Transfer server for receiving files
 pub struct TransferServer {
@@ -41,6 +83,15 @@ impl TransferServer {
         let (transfer_id, file_name, _file_size, total_chunks) = match msg {
             Message::TransferStart(start) => {
                 info!("Receiving file: {} ({} bytes)", start.file_name, start.file_size);
+                // SECURITY: enforce a sane upper bound on chunk count so a
+                // malicious peer can't trap us in a multi-billion-iteration
+                // recv loop.
+                if start.total_chunks > MAX_TOTAL_CHUNKS {
+                    return Err(Error::Protocol(format!(
+                        "total_chunks {} exceeds maximum {}",
+                        start.total_chunks, MAX_TOTAL_CHUNKS
+                    )));
+                }
                 (
                     start.transfer_id,
                     start.file_name,
@@ -72,7 +123,9 @@ impl TransferServer {
         debug!("Sent TRANSFER_ACK");
 
         // Receive chunks
-        let output_path = self.output_dir.join(&file_name);
+        // SECURITY: refuse traversal/absolute-path file names from the peer.
+        let safe_name = sanitize_file_name(&file_name)?;
+        let output_path = self.output_dir.join(safe_name);
         let start_time = Instant::now();
         let stats = self
             .receive_chunks(conn, &output_path, transfer_id, total_chunks, start_time)

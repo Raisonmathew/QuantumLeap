@@ -1,6 +1,6 @@
 //! SQLite-based license repository implementation
 
-use crate::domain::license::{License, LicenseId, LicenseKey, LicenseTier};
+use crate::domain::license::{License, LicenseId, LicenseKey, LicenseVerifier};
 use crate::error::{LicenseError, Result};
 use crate::ports::LicenseRepository;
 use async_trait::async_trait;
@@ -11,6 +11,44 @@ use std::sync::{Arc, Mutex};
 /// SQLite-based license storage
 pub struct SqliteLicenseStore {
     conn: Arc<Mutex<Connection>>,
+    /// Optional verifier. When `Some`, every row read from the database
+    /// is signature-checked before being returned to callers (C5). A row
+    /// whose signature is missing or invalid is rejected as if it did
+    /// not exist — attackers who tamper with the underlying SQLite file
+    /// cannot upgrade tiers, extend expirations, or grant features.
+    verifier: Option<Arc<LicenseVerifier>>,
+}
+
+/// Maximum accepted serialized-License payload size (1 MiB).
+///
+/// SECURITY (CWE-400, CWE-776): `serde_json::from_str` allocates
+/// proportionally to the input, and JSON itself permits deeply nested
+/// structures that blow up parse cost. A row in the `licenses` table
+/// trusted to come from our own writers should be a few KiB; if anything
+/// ever managed to insert a 100 MB blob, every read of that license would
+/// OOM the host. We refuse to even attempt to parse anything larger than
+/// this cap. The bound is loose (real licenses are <8 KiB) but well below
+/// any realistic attacker-driven memory pressure.
+const MAX_LICENSE_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Bounded `License` deserializer used by every read path in this store.
+fn parse_license(data: &str, verifier: Option<&LicenseVerifier>) -> Result<License> {
+    if data.len() > MAX_LICENSE_PAYLOAD_BYTES {
+        return Err(LicenseError::Internal(format!(
+            "License payload {} bytes exceeds {}-byte cap",
+            data.len(),
+            MAX_LICENSE_PAYLOAD_BYTES
+        )));
+    }
+    let license: License =
+        serde_json::from_str::<License>(data).map_err(|e| LicenseError::from(e))?;
+    if let Some(v) = verifier {
+        // Enforce signature — missing or invalid both reject. We do NOT
+        // distinguish the two failure modes to the caller to keep the
+        // attack surface narrow.
+        license.verify_signature(v)?;
+    }
+    Ok(license)
 }
 
 impl SqliteLicenseStore {
@@ -47,6 +85,7 @@ impl SqliteLicenseStore {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            verifier: None,
         })
     }
 
@@ -54,12 +93,18 @@ impl SqliteLicenseStore {
     pub fn in_memory() -> Result<Self> {
         Self::new(":memory:")
     }
+
+    /// Builder: enforce signature verification on every read.
+    pub fn with_verifier(mut self, verifier: Arc<LicenseVerifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
+    }
 }
 
 #[async_trait]
 impl LicenseRepository for SqliteLicenseStore {
     async fn save(&self, license: &License) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let data = serde_json::to_string(license)?;
         
         conn.execute(
@@ -81,39 +126,26 @@ impl LicenseRepository for SqliteLicenseStore {
     }
 
     async fn find_by_id(&self, id: &LicenseId) -> Result<Option<License>> {
-        let conn = self.conn.lock().unwrap();
-        
-        let result = conn
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| LicenseError::Internal(format!("License store lock poisoned: {}", e)))?;
+
+        // Read the JSON-serialized License blob from `data` and deserialize it.
+        // Previously this method only read scalar columns and reconstructed a
+        // *new* License via `License::new()`, which generated a fresh key/id
+        // and dropped device activations, quota usage, and feature flags.
+        let result: Option<String> = conn
             .query_row(
-                "SELECT id, tier, email, key, is_active, created_at, expires_at
-                 FROM licenses WHERE id = ?1",
+                "SELECT data FROM licenses WHERE id = ?1",
                 params![id.as_str()],
-                |row| {
-                    let id_str: String = row.get(0)?;
-                    let tier_str: String = row.get(1)?;
-                    let email: Option<String> = row.get(2)?;
-                    let key_str: String = row.get(3)?;
-                    let is_active: bool = row.get(4)?;
-                    let created_at_str: String = row.get(5)?;
-                    let expires_at_str: Option<String> = row.get(6)?;
-                    
-                    Ok((id_str, tier_str, email, key_str, is_active, created_at_str, expires_at_str))
-                },
+                |row| row.get(0),
             )
             .optional()?;
 
         match result {
-            Some((_id_str, tier_str, email, _key_str, _is_active, _created_at_str, _expires_at_str)) => {
-                let tier = match tier_str.as_str() {
-                    "Free" => LicenseTier::Free,
-                    "Pro" => LicenseTier::Pro,
-                    "Team" => LicenseTier::Team,
-                    "Business" => LicenseTier::Business,
-                    "Enterprise" => LicenseTier::Enterprise,
-                    _ => LicenseTier::Free,
-                };
-                
-                let license = License::new(tier, email);
+            Some(data) => {
+                let license = parse_license(&data, self.verifier.as_deref())?;
                 Ok(Some(license))
             }
             None => Ok(None),
@@ -121,7 +153,7 @@ impl LicenseRepository for SqliteLicenseStore {
     }
 
     async fn find_by_key(&self, key: &LicenseKey) -> Result<Option<License>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         
         let result: Option<String> = conn
             .query_row(
@@ -133,7 +165,7 @@ impl LicenseRepository for SqliteLicenseStore {
 
         match result {
             Some(data) => {
-                let license: License = serde_json::from_str(&data)?;
+                let license = parse_license(&data, self.verifier.as_deref())?;
                 Ok(Some(license))
             }
             None => Ok(None),
@@ -141,7 +173,7 @@ impl LicenseRepository for SqliteLicenseStore {
     }
 
     async fn find_by_user(&self, user_id: &str) -> Result<Option<License>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         
         let result: Option<String> = conn
             .query_row(
@@ -153,7 +185,7 @@ impl LicenseRepository for SqliteLicenseStore {
 
         match result {
             Some(data) => {
-                let license: License = serde_json::from_str(&data)?;
+                let license = parse_license(&data, self.verifier.as_deref())?;
                 Ok(Some(license))
             }
             None => Ok(None),
@@ -161,7 +193,7 @@ impl LicenseRepository for SqliteLicenseStore {
     }
 
     async fn update(&self, license: &License) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let data = serde_json::to_string(license)?;
         
         let rows_affected = conn.execute(
@@ -187,7 +219,7 @@ impl LicenseRepository for SqliteLicenseStore {
     }
 
     async fn delete(&self, key: &LicenseKey) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         
         let rows_affected = conn.execute(
             "DELETE FROM licenses WHERE key = ?1",
@@ -202,7 +234,7 @@ impl LicenseRepository for SqliteLicenseStore {
     }
 
     async fn list_all(&self) -> Result<Vec<License>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         
         let mut stmt = conn.prepare("SELECT data FROM licenses")?;
         let rows = stmt.query_map([], |row| {
@@ -213,7 +245,7 @@ impl LicenseRepository for SqliteLicenseStore {
         let mut licenses = Vec::new();
         for row in rows {
             let data = row?;
-            let license: License = serde_json::from_str(&data)?;
+            let license = parse_license(&data, self.verifier.as_deref())?;
             licenses.push(license);
         }
 
@@ -221,7 +253,7 @@ impl LicenseRepository for SqliteLicenseStore {
     }
 
     async fn exists(&self, key: &LicenseKey) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM licenses WHERE key = ?1",

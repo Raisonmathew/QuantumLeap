@@ -19,47 +19,67 @@ pub struct TlsClientConfig {
 }
 
 impl TlsClientConfig {
-    /// Create a new TLS client configuration
+    /// Create a new TLS client configuration with full peer verification.
+    ///
+    /// SECURITY: This is the ONLY public constructor. Peer-cert and hostname
+    /// verification are always enabled. The previous "verify_hostname=false"
+    /// path installed a `NoVerifier` that accepted every certificate and
+    /// every signature, which trivially defeats TLS (CWE-295). It has been
+    /// removed entirely. Test code that needs a no-verify client must use
+    /// the `#[cfg(test)] new_dangerous_accept_any` constructor below.
     ///
     /// # Arguments
-    /// * `ca_cert_path` - Path to CA certificate file (optional, uses system roots if None)
-    /// * `verify_hostname` - Whether to verify server hostname
-    pub fn new(ca_cert_path: Option<&Path>, verify_hostname: bool) -> Result<Self> {
-        let mut root_store = rustls::RootCertStore::empty();
+    /// * `ca_cert_path` - Path to CA certificate file (optional, uses webpki
+    ///   system roots if `None`).
+    pub fn new(ca_cert_path: Option<&Path>) -> Result<Self> {
+        let root_store = Self::build_root_store(ca_cert_path)?;
+        let config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        Ok(Self {
+            config: Arc::new(config),
+        })
+    }
 
+    /// Build a root certificate store from an optional CA file (or webpki
+    /// roots if `None`). Shared between the secure and the test-only
+    /// constructors so loading logic is identical.
+    fn build_root_store(ca_cert_path: Option<&Path>) -> Result<rustls::RootCertStore> {
+        let mut root_store = rustls::RootCertStore::empty();
         if let Some(ca_path) = ca_cert_path {
-            // Load custom CA certificate
             let ca_file = File::open(ca_path)
                 .map_err(|e| Error::Tls(format!("Failed to open CA cert: {}", e)))?;
             let mut ca_reader = BufReader::new(ca_file);
-            
+
             let ca_certs = certs(&mut ca_reader)
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|e| Error::Tls(format!("Failed to parse CA cert: {}", e)))?;
-            
+
             for cert in ca_certs {
-                root_store.add(cert)
+                root_store
+                    .add(cert)
                     .map_err(|e| Error::Tls(format!("Failed to add CA cert: {}", e)))?;
             }
         } else {
-            // Use system root certificates
-            root_store.extend(
-                webpki_roots::TLS_SERVER_ROOTS
-                    .iter()
-                    .cloned()
-            );
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
+        Ok(root_store)
+    }
 
+    /// Test-only constructor that disables certificate verification by
+    /// installing `NoVerifier`. Compiled out of release builds and not
+    /// callable from non-test code in any other crate.
+    ///
+    /// SECURITY: Never expose this through any other API.
+    #[cfg(test)]
+    pub fn new_dangerous_accept_any() -> Result<Self> {
+        let root_store = Self::build_root_store(None)?;
         let mut config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-
-        if !verify_hostname {
-            // Disable hostname verification (for testing only!)
-            config.dangerous()
-                .set_certificate_verifier(Arc::new(NoVerifier));
-        }
-
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoVerifier));
         Ok(Self {
             config: Arc::new(config),
         })
@@ -149,10 +169,17 @@ impl TlsServerConfig {
     }
 }
 
-/// Certificate verifier that accepts all certificates (for testing only!)
+/// Certificate verifier that accepts ANY certificate.
+///
+/// SECURITY: This struct is `#[cfg(test)]`-only and cannot be reached from
+/// any release build. It exists solely to support the
+/// `TlsClientConfig::new_dangerous_accept_any` constructor used by
+/// integration tests against self-signed peers.
+#[cfg(test)]
 #[derive(Debug)]
 struct NoVerifier;
 
+#[cfg(test)]
 impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     fn verify_server_cert(
         &self,
@@ -249,11 +276,11 @@ mod tests {
     #[test]
     fn test_tls_client_config() {
         // Test with system roots
-        let config = TlsClientConfig::new(None, true);
+        let config = TlsClientConfig::new(None);
         assert!(config.is_ok());
-        
-        // Test without hostname verification
-        let config = TlsClientConfig::new(None, false);
+
+        // Test the cfg(test)-only insecure constructor.
+        let config = TlsClientConfig::new_dangerous_accept_any();
         assert!(config.is_ok());
     }
 }

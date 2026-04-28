@@ -67,8 +67,19 @@ impl AuthLicenseManager {
         }
         drop(users);
 
-        // Hash password (simplified - in production use proper password hashing)
-        let password_hash = format!("hashed_{}", registration.password);
+        // Hash password with Argon2id (OWASP-recommended). The hash is stored
+        // both on the UserAccount and inside the AuthManager session store;
+        // the AuthManager copy is what we verify against during login, but
+        // the UserAccount copy is preserved for migration / introspection.
+        let password_hash = {
+            use argon2::Argon2;
+            use password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+            let salt = SaltString::generate(&mut OsRng);
+            Argon2::default()
+                .hash_password(registration.password.as_bytes(), &salt)
+                .map_err(|e| LicenseError::Internal(format!("Password hashing failed: {}", e)))?
+                .to_string()
+        };
 
         // Register user with AuthManager
         self.auth_manager

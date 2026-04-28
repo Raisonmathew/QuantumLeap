@@ -8,6 +8,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Main error type for QLTP operations
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// I/O error
     #[error("I/O error: {0}")]

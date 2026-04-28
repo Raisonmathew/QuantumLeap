@@ -184,6 +184,42 @@ impl SessionRepository for InMemorySessionRepository {
             .filter(|entry| entry.value().is_active())
             .count())
     }
+
+    /// Override of the trait default with a real atomic compare-and-swap.
+    ///
+    /// `DashMap::entry()` takes a per-shard write lock for the key, so the
+    /// load-compare-store sequence below is observed atomically by every
+    /// other writer touching the same `SessionId`. Two concurrent
+    /// `AcceptSession` messages can no longer both win: exactly one will see
+    /// the matching version and commit; the other will get `Conflict` and
+    /// can retry against the freshly-updated state.
+    async fn update_if_unchanged(
+        &self,
+        session: &crate::domain::Session,
+        expected_version: u64,
+    ) -> Result<()> {
+        use dashmap::mapref::entry::Entry;
+        let id = session.id().clone();
+        match self.sessions.entry(id.clone()) {
+            Entry::Vacant(_) => Err(crate::error::Error::NotFound(format!(
+                "Session {}",
+                id.as_uuid()
+            ))),
+            Entry::Occupied(mut occ) => {
+                let current_version = occ.get().version();
+                if current_version != expected_version {
+                    return Err(crate::error::Error::Conflict(format!(
+                        "Session {} version mismatch: expected {}, found {}",
+                        id.as_uuid(),
+                        expected_version,
+                        current_version
+                    )));
+                }
+                occ.insert(session.clone());
+                Ok(())
+            }
+        }
+    }
 }
 
 /// In-memory connection repository

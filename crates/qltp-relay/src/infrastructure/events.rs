@@ -5,24 +5,41 @@ use crate::ports::{DomainEvent, EventPublisher};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Default bound for the in-process event channel.
+///
+/// SECURITY/RELIABILITY: a previous version used `mpsc::unbounded_channel`,
+/// which lets producers run ahead of consumers indefinitely — a slow or
+/// stuck event subscriber translates directly into unbounded memory
+/// growth on the relay. We now use a bounded channel and apply a
+/// drop-newest-on-full policy for the fire-and-forget `logging_only`
+/// publisher; the `new()` variant returns `SendError::Full` to the
+/// caller so it can apply its own backpressure strategy.
+pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 4096;
 
 /// In-memory event publisher using channels
 #[derive(Clone)]
 pub struct InMemoryEventPublisher {
-    sender: mpsc::UnboundedSender<DomainEvent>,
+    sender: mpsc::Sender<DomainEvent>,
 }
 
 impl InMemoryEventPublisher {
-    /// Create a new in-memory event publisher
-    pub fn new() -> (Self, mpsc::UnboundedReceiver<DomainEvent>) {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    /// Create a new in-memory event publisher with the default capacity.
+    pub fn new() -> (Self, mpsc::Receiver<DomainEvent>) {
+        Self::with_capacity(DEFAULT_EVENT_CHANNEL_CAPACITY)
+    }
+
+    /// Create with an explicit channel capacity.
+    pub fn with_capacity(capacity: usize) -> (Self, mpsc::Receiver<DomainEvent>) {
+        let (sender, receiver) = mpsc::channel(capacity);
         (Self { sender }, receiver)
     }
 
-    /// Create a publisher that logs events but doesn't store them
+    /// Create a publisher that logs events but doesn't store them.
+    /// Drops events on backpressure to keep producers non-blocking.
     pub fn logging_only() -> Self {
-        let (sender, mut receiver) = mpsc::unbounded_channel::<DomainEvent>();
+        let (sender, mut receiver) = mpsc::channel::<DomainEvent>(DEFAULT_EVENT_CHANNEL_CAPACITY);
         
         // Spawn a task to consume and log events
         tokio::spawn(async move {
@@ -45,21 +62,31 @@ impl Default for InMemoryEventPublisher {
 #[async_trait]
 impl EventPublisher for InMemoryEventPublisher {
     async fn publish(&self, event: DomainEvent) -> Result<()> {
-        self.sender
-            .send(event)
-            .map_err(|e| crate::error::Error::Internal(format!("Failed to publish event: {}", e)))?;
-        Ok(())
+        // Use try_send so a stuck consumer never blocks the producer.
+        // On overflow we drop the event and warn — the alternative
+        // (awaiting capacity) lets one slow subscriber stall every
+        // domain mutation in the relay.
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("Event channel full; dropping event");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(
+                crate::error::Error::Internal("Event channel closed".to_string()),
+            ),
+        }
     }
 }
 
 /// Event subscriber for testing
 pub struct EventSubscriber {
-    receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<DomainEvent>>>,
+    receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<DomainEvent>>>,
 }
 
 impl EventSubscriber {
     /// Create a new event subscriber
-    pub fn new(receiver: mpsc::UnboundedReceiver<DomainEvent>) -> Self {
+    pub fn new(receiver: mpsc::Receiver<DomainEvent>) -> Self {
         Self {
             receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
         }

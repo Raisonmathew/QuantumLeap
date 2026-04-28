@@ -100,14 +100,30 @@ impl ContentStore {
     /// Retrieve a chunk
     #[instrument(skip(self))]
     pub async fn retrieve(&self, chunk_id: &ChunkId) -> Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+
         let metadata = self
             .index
             .get(chunk_id)
             .ok_or_else(|| anyhow!("Chunk not found: {}", chunk_id))?;
 
-        let mut file: tokio::fs::File = fs::File::open(&metadata.path).await?;
+        // SECURITY/RELIABILITY (CWE-770): bound the on-disk read to the
+        // size we recorded at insert time. If a chunk file has grown
+        // since (corruption, tampering, race), `read_to_end` would
+        // happily allocate the new size; instead we cap the reader and
+        // require the byte count to match the recorded metadata.
+        let file = fs::File::open(&metadata.path).await?;
+        let mut limited = file.take(metadata.size as u64);
         let mut data = Vec::with_capacity(metadata.size);
-        file.read_to_end(&mut data).await?;
+        limited.read_to_end(&mut data).await?;
+        if data.len() != metadata.size {
+            return Err(anyhow!(
+                "Chunk {} size mismatch: expected {}, read {}",
+                chunk_id,
+                metadata.size,
+                data.len()
+            ));
+        }
 
         debug!("Retrieved chunk {} ({} bytes)", chunk_id, data.len());
 

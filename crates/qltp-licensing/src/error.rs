@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Licensing errors
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum LicenseError {
     /// Invalid license key format or checksum
     #[error("Invalid license key")]
@@ -68,6 +69,14 @@ pub enum LicenseError {
     /// Serialization error
     #[error("Serialization error: {0}")]
     Serialization(String),
+
+    /// License signature is missing where one is required by policy
+    #[error("License signature is required by policy but is absent")]
+    SignatureRequired,
+
+    /// License signature is present but did not verify against the trusted key
+    #[error("License signature verification failed")]
+    InvalidSignature,
 }
 
 /// Result type for licensing operations

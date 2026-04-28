@@ -232,16 +232,39 @@ impl StunMessage {
         data.copy_to_slice(&mut transaction_id);
 
         // Parse attributes
+        //
+        // SECURITY (CWE-835, infinite loop): each iteration MUST consume at
+        // least 4 bytes from the message length budget (the attribute TLV
+        // header). If `encoded_length()` ever returned 0 (or any value <4)
+        // the previous `saturating_sub` would leave `remaining` unchanged
+        // and the loop would spin forever on a crafted packet. We now
+        // enforce strict forward progress: an iteration that consumes less
+        // than the minimum header size is treated as a malformed message
+        // and rejected.
+        const ATTR_HEADER_SIZE: usize = 4;
         let mut attributes = Vec::new();
         let mut remaining = length as usize;
 
         while remaining > 0 {
-            if data.remaining() < 4 {
+            if data.remaining() < ATTR_HEADER_SIZE {
                 return Err("Incomplete attribute header".to_string());
             }
 
             let attr = StunAttribute::decode(&mut data)?;
-            remaining = remaining.saturating_sub(attr.encoded_length() as usize);
+            let consumed = attr.encoded_length() as usize;
+            if consumed < ATTR_HEADER_SIZE {
+                return Err(format!(
+                    "Malformed STUN attribute: encoded_length {} < header size {}",
+                    consumed, ATTR_HEADER_SIZE
+                ));
+            }
+            if consumed > remaining {
+                return Err(format!(
+                    "STUN attribute consumed {} bytes past message length budget",
+                    consumed - remaining
+                ));
+            }
+            remaining -= consumed;
             attributes.push(attr);
         }
 

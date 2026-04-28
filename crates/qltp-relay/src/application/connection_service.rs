@@ -301,6 +301,8 @@ impl Default for ConnectionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::connection::ConnectionStrategy;
+    use crate::domain::nat_type::NatType;
 
     fn create_test_request() -> InitiateConnectionRequest {
         InitiateConnectionRequest {

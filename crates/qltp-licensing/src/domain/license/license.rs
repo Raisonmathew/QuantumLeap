@@ -5,6 +5,7 @@ use super::{
     feature_flags::{Feature, FeatureFlags},
     license_key::LicenseKey,
     license_tier::LicenseTier,
+    signing::{LicenseSigner, LicenseVerifier},
 };
 use crate::error::{LicenseError, Result};
 use chrono::{DateTime, Utc};
@@ -37,6 +38,13 @@ pub struct License {
     last_validated_at: DateTime<Utc>,
     /// Whether license is active
     is_active: bool,
+    /// Detached Ed25519 signature (base64) over the canonical payload of
+    /// every other field. `None` means the license has not yet been
+    /// signed (newly minted before signer wiring, or imported from a
+    /// pre-signing dataset). When a `LicenseVerifier` is configured on a
+    /// repository, a `None` here is rejected as `SignatureRequired`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
 
 impl License {
@@ -55,6 +63,7 @@ impl License {
             expires_at: None, // Default to perpetual
             last_validated_at: now,
             is_active: true,
+            signature: None,
         }
     }
 
@@ -281,6 +290,55 @@ impl License {
         } else {
             false
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Cryptographic integrity (C5)
+    // ---------------------------------------------------------------
+
+    /// Whether this license currently carries a signature.
+    pub fn is_signed(&self) -> bool {
+        self.signature.is_some()
+    }
+
+    /// Borrow the raw base64 signature, if any.
+    pub fn signature(&self) -> Option<&str> {
+        self.signature.as_deref()
+    }
+
+    /// Build the deterministic byte string that signing/verification
+    /// covers. We serialize a clone with the signature field cleared so
+    /// the signature itself is not included in its own input. Field order
+    /// is fixed by the struct definition, which `serde_json` honours.
+    pub fn canonical_payload(&self) -> Result<Vec<u8>> {
+        let mut clone = self.clone();
+        clone.signature = None;
+        serde_json::to_vec(&clone).map_err(LicenseError::from)
+    }
+
+    /// Sign (or re-sign) this license in place using the supplied signer.
+    ///
+    /// Mutating any field after this call invalidates the signature; the
+    /// service layer is responsible for calling `sign` again before
+    /// persisting the mutation.
+    pub fn sign(&mut self, signer: &LicenseSigner) -> Result<()> {
+        let payload = self.canonical_payload()?;
+        self.signature = Some(signer.sign(&payload));
+        Ok(())
+    }
+
+    /// Verify the embedded signature against the supplied verifier.
+    ///
+    /// Returns `SignatureRequired` if no signature is present, and
+    /// `InvalidSignature` if a signature is present but does not
+    /// validate. Verification is constant-time inside `LicenseVerifier`.
+    pub fn verify_signature(&self, verifier: &LicenseVerifier) -> Result<()> {
+        let sig = self
+            .signature
+            .as_deref()
+            .ok_or(LicenseError::SignatureRequired)?;
+        let payload = self.canonical_payload()?;
+        verifier.verify(&payload, sig)
     }
 }
 

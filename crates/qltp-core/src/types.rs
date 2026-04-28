@@ -163,9 +163,19 @@ pub struct TransferResult {
 }
 
 impl TransferResult {
-    /// Calculate effective speed in bytes per second
+    /// Calculate effective speed in bytes per second.
+    ///
+    /// Returns `0.0` when `duration` is zero (or sub-nanosecond) instead
+    /// of producing `+inf` / `NaN`. A zero-duration transfer is reported
+    /// as zero throughput rather than infinity so downstream metrics,
+    /// dashboards, and JSON serializers don't get poisoned values.
     pub fn speed_bps(&self) -> f64 {
-        self.bytes_transferred as f64 / self.duration.as_secs_f64()
+        let secs = self.duration.as_secs_f64();
+        if secs <= 0.0 || !secs.is_finite() {
+            0.0
+        } else {
+            self.bytes_transferred as f64 / secs
+        }
     }
 
     /// Calculate effective speed in megabytes per second

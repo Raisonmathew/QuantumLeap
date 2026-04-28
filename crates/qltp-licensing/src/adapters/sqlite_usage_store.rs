@@ -64,7 +64,7 @@ impl SqliteUsageStore {
 #[async_trait]
 impl UsageRepository for SqliteUsageStore {
     async fn save(&self, record: &UsageRecord) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         
         conn.execute(
             "INSERT INTO usage_records (id, license_id, bytes, transfer_type, timestamp)
@@ -82,7 +82,7 @@ impl UsageRepository for SqliteUsageStore {
     }
 
     async fn find_by_id(&self, id: &str) -> Result<Option<UsageRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         
         let result = conn
             .query_row(
@@ -133,7 +133,7 @@ impl UsageRepository for SqliteUsageStore {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<UsageRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         
         let mut stmt = conn.prepare(
             "SELECT id, license_id, bytes, transfer_type, timestamp
@@ -189,7 +189,7 @@ impl UsageRepository for SqliteUsageStore {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         
         let total: Option<i64> = conn.query_row(
             "SELECT SUM(bytes) FROM usage_records 
@@ -217,7 +217,7 @@ impl UsageRepository for SqliteUsageStore {
     }
 
     async fn delete_before(&self, timestamp: DateTime<Utc>) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         
         let rows_affected = conn.execute(
             "DELETE FROM usage_records WHERE timestamp < ?1",
@@ -228,7 +228,7 @@ impl UsageRepository for SqliteUsageStore {
     }
 
     async fn get_recent(&self, limit: usize) -> Result<Vec<UsageRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         
         let mut stmt = conn.prepare(
             "SELECT id, license_id, bytes, transfer_type, timestamp

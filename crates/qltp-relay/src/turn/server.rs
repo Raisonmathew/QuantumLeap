@@ -3,7 +3,7 @@
 //! Handles TURN protocol messages and manages relay functionality
 
 use bytes::Bytes;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -33,9 +33,14 @@ pub struct TurnServerConfig {
 impl Default for TurnServerConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0:3478".parse().unwrap(),
-            relay_base_addr: "0.0.0.0:0".parse().unwrap(),
-            max_allocations: 1000,
+            // Infallible constructors so a future literal typo can't
+            // panic at default construction.
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3478),
+            relay_base_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            // SECURITY: tighter default to bound memory/fd usage on a
+            // server that hasn't been explicitly configured. Operators
+            // who genuinely need 1k+ allocations must opt in.
+            max_allocations: 256,
             default_lifetime: 600,
             cleanup_interval: Duration::from_secs(60),
             software: "QLTP-TURN/1.0".to_string(),

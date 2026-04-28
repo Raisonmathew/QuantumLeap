@@ -122,45 +122,58 @@ impl PendingOperation {
 /// Buffer pool for zero-copy operations (Phase 2)
 struct BufferPool {
     buffers: Vec<Vec<u8>>,
-    available: Vec<usize>,
+    /// Set of currently-free buffer indices. Using `HashSet` keeps both
+    /// `acquire`/`release` O(1) average; the previous `Vec<usize>` made
+    /// `release` linear via `Vec::contains`, which dominated under load.
+    available: std::collections::HashSet<usize>,
+    /// FIFO ordering of free indices for cache-friendly reuse. Pulling from
+    /// the back behaves like a stack and reuses recently-released buffers.
+    available_order: Vec<usize>,
     registered: bool,
 }
 
 impl BufferPool {
     fn new() -> Self {
         let mut buffers = Vec::with_capacity(BUFFER_POOL_SIZE);
-        let mut available = Vec::with_capacity(BUFFER_POOL_SIZE);
-        
+        let mut available = std::collections::HashSet::with_capacity(BUFFER_POOL_SIZE);
+        let mut available_order = Vec::with_capacity(BUFFER_POOL_SIZE);
+
         for i in 0..BUFFER_POOL_SIZE {
             buffers.push(vec![0u8; BUFFER_SIZE]);
-            available.push(i);
+            available.insert(i);
+            available_order.push(i);
         }
-        
+
         Self {
             buffers,
             available,
+            available_order,
             registered: false,
         }
     }
-    
+
     fn acquire(&mut self) -> Option<usize> {
-        self.available.pop()
+        let idx = self.available_order.pop()?;
+        self.available.remove(&idx);
+        Some(idx)
     }
-    
+
     fn release(&mut self, index: usize) {
-        if index < BUFFER_POOL_SIZE && !self.available.contains(&index) {
-            self.available.push(index);
+        // O(1) duplicate guard via the HashSet; the old Vec::contains was O(n)
+        // and showed up in flame graphs at high concurrency.
+        if index < BUFFER_POOL_SIZE && self.available.insert(index) {
+            self.available_order.push(index);
         }
     }
-    
+
     fn get_buffer(&self, index: usize) -> Option<&[u8]> {
         self.buffers.get(index).map(|b| b.as_slice())
     }
-    
+
     fn get_buffer_mut(&mut self, index: usize) -> Option<&mut [u8]> {
         self.buffers.get_mut(index).map(|b| b.as_mut_slice())
     }
-    
+
     fn buffer_ptrs(&self) -> Vec<libc::iovec> {
         self.buffers
             .iter()

@@ -203,7 +203,22 @@ pub struct AllocationManager {
     next_relay_port: Arc<RwLock<u16>>,
     /// Relay address base
     relay_base_addr: SocketAddr,
+    /// Per-source-IP active-allocation count.
+    ///
+    /// SECURITY: TURN allocations are expensive (one relay port + state
+    /// per allocation) and the original `create_allocation` only enforced
+    /// a single allocation per `(IP, port)` tuple. A misbehaving client
+    /// behind a NAT can mint thousands of allocations from the same IP
+    /// by varying its source port, exhausting the relay-port pool. We
+    /// track the active count per source IP and refuse new allocations
+    /// once the per-IP ceiling is hit.
+    per_ip_count: Arc<RwLock<HashMap<std::net::IpAddr, usize>>>,
 }
+
+/// Maximum simultaneously-held allocations per source IP. 32 covers
+/// reasonable carrier-grade NAT scenarios while bounding the
+/// damage one rogue IP can do to the relay-port pool.
+const MAX_ALLOCATIONS_PER_IP: usize = 32;
 
 impl AllocationManager {
     /// Create new allocation manager
@@ -214,6 +229,7 @@ impl AllocationManager {
             relay_to_allocation: Arc::new(RwLock::new(HashMap::new())),
             next_relay_port: Arc::new(RwLock::new(49152)), // Start of dynamic port range
             relay_base_addr,
+            per_ip_count: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -236,6 +252,21 @@ impl AllocationManager {
         }
         drop(client_map);
 
+        // Per-source-IP cap: prevents a single host from monopolising the
+        // relay-port pool by binding many ephemeral source ports.
+        {
+            let per_ip = self.per_ip_count.read().await;
+            if per_ip.get(&client_addr.ip()).copied().unwrap_or(0)
+                >= MAX_ALLOCATIONS_PER_IP
+            {
+                return Err(format!(
+                    "Per-IP allocation cap ({}) reached for {}",
+                    MAX_ALLOCATIONS_PER_IP,
+                    client_addr.ip()
+                ));
+            }
+        }
+
         // Allocate relay address
         let relay_addr = self.allocate_relay_address().await?;
 
@@ -256,10 +287,12 @@ impl AllocationManager {
         let mut allocations = self.allocations.write().await;
         let mut client_map = self.client_to_allocation.write().await;
         let mut relay_map = self.relay_to_allocation.write().await;
+        let mut per_ip = self.per_ip_count.write().await;
 
         allocations.insert(id.clone(), allocation.clone());
         client_map.insert(client_addr, id.clone());
         relay_map.insert(relay_addr, id);
+        *per_ip.entry(client_addr.ip()).or_insert(0) += 1;
 
         Ok(allocation)
     }
@@ -350,13 +383,25 @@ impl AllocationManager {
         channel_number: u16,
         peer_addr: SocketAddr,
     ) -> Result<(), String> {
-        let client_map = self.client_to_allocation.read().await;
-        let id = client_map.get(client_addr)
-            .ok_or_else(|| "No allocation found".to_string())?
-            .clone();
-        drop(client_map);
-
+        // CONCURRENCY (TOCTOU): the previous version released the
+        // `client_to_allocation` read lock before grabbing the
+        // `allocations` write lock. In that window another task could
+        // delete or replace the allocation, so the subsequent
+        // `get_mut(&id)` either failed silently or mutated a different
+        // allocation. We now acquire the write lock on `allocations`
+        // FIRST, and look up the allocation id with the client_to_allocation
+        // read lock held only as long as needed inside that critical
+        // section. The two-lock acquisition order matches every other
+        // mutation path (allocations -> client_to_allocation), avoiding
+        // deadlock.
         let mut allocations = self.allocations.write().await;
+        let id = {
+            let client_map = self.client_to_allocation.read().await;
+            client_map
+                .get(client_addr)
+                .ok_or_else(|| "No allocation found".to_string())?
+                .clone()
+        };
         let allocation = allocations.get_mut(&id)
             .ok_or_else(|| "Allocation not found".to_string())?;
 
@@ -370,6 +415,7 @@ impl AllocationManager {
         let mut allocations = self.allocations.write().await;
         let mut client_map = self.client_to_allocation.write().await;
         let mut relay_map = self.relay_to_allocation.write().await;
+        let mut per_ip = self.per_ip_count.write().await;
 
         // Find expired allocations
         let expired_ids: Vec<String> = allocations
@@ -383,6 +429,15 @@ impl AllocationManager {
             if let Some(allocation) = allocations.remove(&id) {
                 client_map.remove(&allocation.client_addr);
                 relay_map.remove(&allocation.relay_addr);
+                // Decrement per-IP counter, removing the entry when it
+                // drops to zero so the table doesn't accumulate dead IPs.
+                let ip = allocation.client_addr.ip();
+                if let Some(slot) = per_ip.get_mut(&ip) {
+                    *slot = slot.saturating_sub(1);
+                    if *slot == 0 {
+                        per_ip.remove(&ip);
+                    }
+                }
             }
         }
 

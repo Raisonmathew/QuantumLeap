@@ -109,6 +109,14 @@ impl TransportManager {
             caps.max_throughput_gbps()
         );
 
+        // Track which backend is active and register it with the monitor so
+        // metrics recorded on send/receive land in the right bucket. Without
+        // this, monitor.record_send() was a no-op because the bucket was
+        // never created.
+        let transport_type = caps.transport_type;
+        state.monitor.register_backend(transport_type).await;
+        state.current_backend_type = Some(transport_type);
+
         state.backend = Some(backend);
         Ok(())
     }
@@ -428,19 +436,48 @@ impl TransportManager {
         selector.select_optimal(criteria)
     }
 
-    /// Auto-select and initialize backend
+    /// Auto-select and initialize backend.
+    ///
+    /// Selects the optimal backend for the current platform / criteria, then
+    /// actually constructs and initializes it via the backend factory. After
+    /// this call returns `Ok`, the manager is ready to create sessions and
+    /// transfer data.
+    ///
+    /// If `criteria` is `None` and the manager was constructed with a
+    /// `preferred_transport`, that transport is used directly (no scoring),
+    /// matching what most CLI users expect when they pass `--transport ...`.
     pub async fn auto_initialize(&self, criteria: Option<SelectionCriteria>) -> Result<SelectionResult> {
+        // Honor an explicit preferred_transport when no criteria override is
+        // supplied. This skips the scoring step and trusts the operator.
+        if criteria.is_none() {
+            let preferred = {
+                let s = self.state.read().await;
+                s.config.preferred_transport
+            };
+            if let Some(t) = preferred {
+                let backend = crate::application::backend_factory::build_backend(t)?;
+                self.initialize(backend).await?;
+                return Ok(SelectionResult {
+                    transport_type: t,
+                    reason: "explicitly requested via TransportManagerConfig.preferred_transport"
+                        .to_string(),
+                    capabilities: crate::domain::BackendCapabilities::for_transport(t),
+                    fallbacks: Vec::new(),
+                });
+            }
+        }
+
         let criteria = criteria.unwrap_or_default();
         let selection = self.select_optimal_backend(&criteria)?;
-        
+
         info!(
             "Auto-selected backend: {} - {}",
             selection.transport_type, selection.reason
         );
-        
-        // Note: Backend initialization requires a concrete backend instance
-        // This will be implemented when we integrate with the adapters
-        
+
+        let backend = crate::application::backend_factory::build_backend(selection.transport_type)?;
+        self.initialize(backend).await?;
+
         Ok(selection)
     }
 
@@ -450,44 +487,57 @@ impl TransportManager {
         selector.list_available_backends()
     }
 
-    /// Initialize with automatic fallback
+    /// Initialize with automatic fallback.
     ///
-    /// Tries to initialize the optimal backend, automatically falling back
-    /// to alternative transports if the primary fails.
+    /// Tries to initialize the optimal backend, automatically falling back to
+    /// alternative transports if the primary fails. On success, the manager
+    /// is initialized with the first backend that constructed and started
+    /// cleanly.
     pub async fn initialize_with_fallback(
         &self,
         criteria: Option<SelectionCriteria>,
         retry_config: Option<RetryConfig>,
     ) -> Result<FallbackResult> {
         use crate::application::FallbackManager;
-        
+
         let fallback_manager = FallbackManager::new(retry_config.unwrap_or_default());
         let criteria = criteria.unwrap_or_default();
 
-        // Create initialization function
-        let state = self.state.clone();
+        // For each candidate transport type the fallback manager hands us, try
+        // to actually build + initialize that backend through the manager.
+        // Cloning `self.state` lets the closure outlive the borrow of `self`.
+        let state_for_init = self.state.clone();
         let init_fn = move |transport_type: TransportType| {
-            let state = state.clone();
+            let state = state_for_init.clone();
             async move {
-                // Note: This is a placeholder. Actual backend initialization
-                // will be implemented when we integrate with concrete adapters.
-                info!("Initializing backend: {}", transport_type);
-                
-                // For now, just validate that the backend is available
+                // Build the concrete backend (errors here are e.g. "feature
+                // disabled" or "not on this platform" - they let the fallback
+                // manager move on to the next candidate).
+                let mut backend = crate::application::backend_factory::build_backend(transport_type)?;
+
+                // Pre-flight platform check using the live platform info kept
+                // in manager state.
                 let platform = {
                     let s = state.read().await;
                     s.platform.clone()
                 };
-                
-                let caps = BackendCapabilities::for_transport(transport_type);
-                
+                let caps = backend.capabilities();
                 if !caps.is_available(&platform) {
                     return Err(Error::Configuration(format!(
                         "Backend {} not available on this platform",
                         transport_type
                     )));
                 }
-                
+
+                backend.initialize().await?;
+
+                // Install the backend into the manager state, registering with
+                // the monitor so metrics flow correctly.
+                let mut s = state.write().await;
+                s.monitor.register_backend(transport_type).await;
+                s.current_backend_type = Some(transport_type);
+                s.backend = Some(backend);
+                info!("Backend {} installed via fallback", transport_type);
                 Ok(())
             }
         };

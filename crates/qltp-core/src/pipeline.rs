@@ -298,6 +298,26 @@ impl TransferPipeline {
             result.compression_ratio
         );
 
+        // CORRECTNESS: previously this method returned `Ok(result)` even when
+        // some chunks failed to read, store, or transfer — the failures were
+        // counted into `transfer_errors`, logged at WARN, and silently
+        // dropped from the caller's result. That is silent data loss: the
+        // caller believed every byte made it across.
+        //
+        // We now treat ANY chunk failure as a transfer-level failure. The
+        // partial result is still surfaced to the caller via the error
+        // payload so they can decide whether to resume or restart, but the
+        // return value is unambiguously `Err`.
+        if transfer_errors > 0 {
+            return Err(Error::Other(format!(
+                "Transfer failed: {} of {} chunks did not complete ({} bytes succeeded in {:?})",
+                transfer_errors,
+                chunks_to_process.len(),
+                result.bytes_transferred,
+                result.duration
+            )));
+        }
+
         Ok(result)
     }
 
@@ -340,23 +360,28 @@ impl TransferPipeline {
         Err(last_error.unwrap_or_else(|| Error::Other("Transfer failed".to_string())))
     }
 
-    /// Determine if compression should be used based on transport characteristics
+    /// Determine if compression should be used based on transport characteristics.
+    ///
+    /// On very high-throughput links (>= 1 GB/s) the CPU cost of compression
+    /// often exceeds the bandwidth saved, so we explicitly opt out. The old
+    /// implementation had two identical branches that always returned `true`,
+    /// negating the speed-aware logic.
     async fn should_compress_for_transport(&self, mode: TransferMode) -> bool {
         if mode == TransferMode::Local {
             return true; // Always compress for local storage
         }
 
-        // For remote transfers, check transport capabilities
         match self.transport.get_capabilities().await {
             Ok(caps) => {
-                // High-speed transports (>500 MB/s) may not benefit from compression
-                // due to CPU overhead vs network speed tradeoff
                 let throughput_mbps = caps.max_throughput_gbps() * 1000.0;
-                
-                if throughput_mbps > 500.0 {
-                    debug!("High-speed transport ({:.0} MB/s), compression may not be beneficial", throughput_mbps);
-                    // Still compress, but this could be made configurable
-                    true
+                // 1 GB/s threshold: above this, compression is usually a net
+                // throughput loss on a single core.
+                if throughput_mbps >= 1000.0 {
+                    debug!(
+                        "Skipping compression on high-speed transport ({:.0} MB/s)",
+                        throughput_mbps
+                    );
+                    false
                 } else {
                     true
                 }

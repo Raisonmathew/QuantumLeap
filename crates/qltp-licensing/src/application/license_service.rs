@@ -2,23 +2,58 @@
 //!
 //! Orchestrates license operations using domain entities and repository ports
 
-use crate::domain::license::{Device, DeviceId, License, LicenseKey, LicenseTier};
+use crate::domain::license::{Device, DeviceId, License, LicenseKey, LicenseSigner, LicenseTier};
 use crate::domain::usage::Quota;
 use crate::error::{LicenseError, Result};
 use crate::ports::LicenseRepository;
-use qltp_auth::AuthToken;
+use qltp_auth::{AuthToken, RateLimiter};
 use std::str::FromStr;
 use std::sync::Arc;
 
 /// License service for managing licenses
 pub struct LicenseService {
     repository: Arc<dyn LicenseRepository>,
+    /// Optional Ed25519 signer. When `Some`, every license created or
+    /// mutated through this service is signed before persistence (C5).
+    /// When `None`, licenses are written without signatures — acceptable
+    /// only in development; production deployments MUST configure one.
+    signer: Option<Arc<LicenseSigner>>,
+    /// Optional rate limiter for license-key activation attempts (C4),
+    /// keyed by the supplied license-key string. Defends against offline
+    /// brute-forcing of valid keys via repeated `activate_license` calls.
+    activation_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl LicenseService {
     /// Create a new license service
     pub fn new(repository: Arc<dyn LicenseRepository>) -> Self {
-        Self { repository }
+        Self {
+            repository,
+            signer: None,
+            activation_limiter: None,
+        }
+    }
+
+    /// Builder: attach a signer so all writes produce signed licenses.
+    pub fn with_signer(mut self, signer: Arc<LicenseSigner>) -> Self {
+        self.signer = Some(signer);
+        self
+    }
+
+    /// Builder: attach a rate limiter applied to `activate_license`
+    /// (keyed by the candidate key string). Strongly recommended in any
+    /// network-exposed deployment.
+    pub fn with_activation_rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.activation_limiter = Some(limiter);
+        self
+    }
+
+    /// Sign `license` in place if a signer is configured. No-op otherwise.
+    fn maybe_sign(&self, license: &mut License) -> Result<()> {
+        if let Some(s) = &self.signer {
+            license.sign(s)?;
+        }
+        Ok(())
     }
 
     /// Create a new license
@@ -27,13 +62,28 @@ impl LicenseService {
         tier: LicenseTier,
         email: Option<String>,
     ) -> Result<License> {
-        let license = License::new(tier, email);
+        let mut license = License::new(tier, email);
+        self.maybe_sign(&mut license)?;
         self.repository.save(&license).await?;
         Ok(license)
     }
 
     /// Activate a license with a key
     pub async fn activate_license(&self, key: &str) -> Result<License> {
+        // Rate-limit BEFORE we touch the repository: refusing the lookup
+        // is the cheapest defence against high-rate brute force (C4).
+        // Keying by the trimmed/uppercased input means each candidate key
+        // gets its own bucket; this primarily blunts brute-force loops
+        // that hammer the same near-valid key with mutated checksums.
+        if let Some(limiter) = &self.activation_limiter {
+            let bucket_key = key.trim().to_uppercase();
+            if let Err(rl) = limiter.check(&bucket_key) {
+                return Err(LicenseError::RateLimitExceeded {
+                    message: format!("retry after {:?}", rl.retry_after),
+                });
+            }
+        }
+
         let license_key = LicenseKey::from_string(key.to_string())?;
         
         let license = self.repository.find_by_key(&license_key).await?
@@ -63,6 +113,7 @@ impl LicenseService {
         
         let device = Device::new(device_name, fingerprint, os, hostname);
         license.activate_device(device)?;
+        self.maybe_sign(&mut license)?;
         self.repository.update(&license).await?;
         
         Ok(())
@@ -82,6 +133,7 @@ impl LicenseService {
             .ok_or(LicenseError::LicenseNotFound)?;
         
         license.deactivate_device(&device_id)?;
+        self.maybe_sign(&mut license)?;
         self.repository.update(&license).await?;
         
         Ok(())
@@ -99,6 +151,7 @@ impl LicenseService {
             .ok_or(LicenseError::LicenseNotFound)?;
         
         license.upgrade_tier(new_tier)?;
+        self.maybe_sign(&mut license)?;
         self.repository.update(&license).await?;
         
         Ok(license)
@@ -116,6 +169,7 @@ impl LicenseService {
             .ok_or(LicenseError::LicenseNotFound)?;
         
         license.link_user(token);
+        self.maybe_sign(&mut license)?;
         self.repository.update(&license).await?;
         
         Ok(())
@@ -220,8 +274,10 @@ mod tests {
         ).await.unwrap();
         
         let key = license.key().to_string();
-        let fingerprint = DeviceFingerprint::generate();
-        
+        // The service takes the fingerprint as a `String`; the legacy
+        // `DeviceFingerprint::generate()` API no longer exists.
+        let fingerprint = "test-fingerprint".to_string();
+
         service.activate_device(
             &key,
             "My Laptop".to_string(),

@@ -1,12 +1,64 @@
 //! Authentication service (application layer)
 
-use crate::domain::{AuthToken, Credentials, Session};
+use crate::domain::{AuthToken, Credentials, RateLimiter, Session};
 use crate::error::{AuthError, Result};
 use crate::ports::SessionStore;
-use sha2::{Digest, Sha256};
+use argon2::Argon2;
+use password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
+
+/// A precomputed Argon2id PHC string used as a constant-time decoy when
+/// the supplied username does not exist.
+///
+/// SECURITY (C15 — username-existence timing oracle): the previous
+/// implementation early-returned `InvalidCredentials` whenever a username
+/// was unknown, skipping the (deliberately) expensive Argon2 verify. An
+/// attacker measuring response latency could therefore distinguish
+/// "valid username, wrong password" (slow) from "unknown username"
+/// (fast), enumerating the entire user database. We now route the
+/// not-found path through a verify against this fixed dummy hash so
+/// every authentication attempt costs roughly the same amount of CPU.
+///
+/// The hash is generated once per process via `OnceLock` so we do not
+/// regenerate the salt on every miss (which would itself be a slower
+/// path than a hit and re-introduce the oracle in inverted form).
+fn dummy_hash() -> &'static str {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY.get_or_init(|| {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(b"qltp-dummy-password-for-timing-equalization", &salt)
+            .expect("argon2 default parameters always succeed")
+            .to_string()
+    })
+}
+
+/// Hash a password with Argon2id using a fresh random salt.
+///
+/// Returns a PHC-format string that bundles algorithm, parameters, salt, and
+/// hash so the verifier needs no extra metadata.
+fn hash_password(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| AuthError::Internal(format!("Password hashing failed: {}", e)))
+}
+
+/// Constant-time verify a password against a stored PHC hash.
+fn verify_password(password: &str, stored_phc: &str) -> bool {
+    match PasswordHash::new(stored_phc) {
+        Ok(parsed) => Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    }
+}
 
 /// Session information for display
 #[derive(Debug, Clone)]
@@ -28,6 +80,10 @@ pub struct AuthService {
     session_store: Arc<dyn SessionStore>,
     /// Session time-to-live
     session_ttl: Duration,
+    /// Optional per-username rate limiter for `authenticate` (C3).
+    /// `None` means unlimited (legacy behaviour); production callers MUST
+    /// configure one via [`AuthService::with_rate_limiter`].
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl AuthService {
@@ -37,14 +93,24 @@ impl AuthService {
             credentials: Arc::new(RwLock::new(HashMap::new())),
             session_store,
             session_ttl,
+            rate_limiter: None,
         }
     }
 
-    /// Add a user with credentials
+    /// Builder: install a rate limiter applied to every `authenticate`
+    /// call, keyed by username. Defends against credential stuffing /
+    /// online password guessing.
+    pub fn with_rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Add a user with credentials.
+    ///
+    /// The password is hashed with Argon2id (OWASP-recommended) using a
+    /// fresh random 16-byte salt. Plaintext is never stored.
     pub fn add_user(&self, username: String, password: String) -> Result<()> {
-        let mut hasher = Sha256::new();
-        hasher.update(password.as_bytes());
-        let password_hash = hex::encode(hasher.finalize());
+        let password_hash = hash_password(&password)?;
 
         let mut creds = self
             .credentials
@@ -66,35 +132,63 @@ impl AuthService {
         Ok(())
     }
 
-    /// Authenticate with credentials and create session
+    /// Authenticate with credentials and create session.
+    ///
+    /// Verifies the supplied password against the stored Argon2id hash in
+    /// constant time. On success, generates a CSPRNG-backed session token.
+    ///
+    /// SECURITY:
+    /// - Rate-limited per username (C3): `RateLimited` is returned ahead
+    ///   of any cryptographic work, but is checked AFTER the existence
+    ///   check would have happened, so a flood of unknown usernames also
+    ///   trips the limit on those usernames.
+    /// - Timing-oracle hardened (C15): the `verify_password` step ALWAYS
+    ///   runs — against the real stored hash if the user exists, or
+    ///   against a fixed dummy hash if not — so response time does not
+    ///   reveal username existence.
     pub fn authenticate(&self, credentials: &Credentials) -> Result<AuthToken> {
-        // Verify credentials
-        let creds = self
-            .credentials
-            .read()
-            .map_err(|e| AuthError::Internal(format!("Lock error: {}", e)))?;
-
-        let mut hasher = Sha256::new();
-        hasher.update(credentials.password.as_bytes());
-        let password_hash = hex::encode(hasher.finalize());
-
-        match creds.get(&credentials.username) {
-            Some(stored_hash) if stored_hash == &password_hash => {
-                drop(creds); // Release read lock
-
-                // Create session
-                let token = AuthToken::new();
-                let session = Session::new(
-                    token.clone(),
-                    credentials.username.clone(),
-                    self.session_ttl,
-                );
-
-                self.session_store.save(session)?;
-                Ok(token)
+        // Rate-limit FIRST: a successful brute-force attempt costs the
+        // attacker an Argon2 verify per try, but we still want to refuse
+        // sustained traffic without doing the work.
+        if let Some(limiter) = &self.rate_limiter {
+            if let Err(rl) = limiter.check(&credentials.username) {
+                return Err(AuthError::RateLimited {
+                    retry_after: rl.retry_after,
+                });
             }
-            _ => Err(AuthError::InvalidCredentials),
         }
+
+        // Look up the stored hash, but DO NOT short-circuit if missing.
+        // Use a constant dummy hash on the not-found path so the verify
+        // cost is identical either way.
+        let stored_hash: String = {
+            let creds = self
+                .credentials
+                .read()
+                .map_err(|e| AuthError::Internal(format!("Lock error: {}", e)))?;
+            creds.get(&credentials.username).cloned().unwrap_or_else(|| dummy_hash().to_string())
+        };
+        let user_exists = stored_hash != dummy_hash();
+
+        let password_ok = verify_password(&credentials.password, &stored_hash);
+
+        // Reject in the same arm whether the user is unknown OR the
+        // password is wrong — same error, same code path, same timing
+        // (within Argon2id's tolerance).
+        if !(user_exists && password_ok) {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        // Create session
+        let token = AuthToken::new();
+        let session = Session::new(
+            token.clone(),
+            credentials.username.clone(),
+            self.session_ttl,
+        );
+
+        self.session_store.save(session)?;
+        Ok(token)
     }
 
     /// Verify a token and refresh session

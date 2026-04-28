@@ -1,5 +1,6 @@
 //! Application layer - Use cases and orchestration
 
+pub mod backend_factory;
 pub mod backend_monitor;
 pub mod backend_selector;
 pub mod fallback_manager;
@@ -7,6 +8,7 @@ pub mod transport_manager;
 pub mod transfer_client;
 pub mod transfer_server;
 
+pub use backend_factory::{build_backend, buildable_transports};
 pub use backend_monitor::{
     BackendMetrics, BackendMonitor, HealthCheckResult, HealthStatus, MonitorConfig, MonitorSummary,
 };

@@ -66,6 +66,7 @@ pub use domain::{
     Device, DeviceFingerprint, DeviceId,
     Feature, FeatureFlags,
     License, LicenseId, LicenseKey, LicenseTier,
+    LicenseSigner, LicenseVerifier,
     Quota, TransferType, UsageRecord, UsageRecordId,
 };
 pub use error::{LicenseError, Result};

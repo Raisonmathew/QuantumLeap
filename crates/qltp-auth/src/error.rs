@@ -1,9 +1,11 @@
 //! Error types for authentication
 
 use thiserror::Error;
+use std::time::Duration;
 
 /// Authentication errors
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum AuthError {
     /// Invalid credentials provided
     #[error("Invalid credentials")]
@@ -16,6 +18,10 @@ pub enum AuthError {
     /// Token has expired
     #[error("Token expired")]
     TokenExpired,
+
+    /// Too many recent attempts — caller is being rate-limited.
+    #[error("Rate limit exceeded; retry after {retry_after:?}")]
+    RateLimited { retry_after: Duration },
 
     /// Internal error (lock poisoning, etc.)
     #[error("Internal error: {0}")]

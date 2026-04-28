@@ -11,6 +11,15 @@ pub type Error = anyhow::Error;
 /// Result type for compression operations
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Default maximum decompressed size (256 MiB).
+///
+/// Chosen to comfortably fit a single QLTP transfer chunk (which is at most
+/// a few MiB after content-defined chunking) plus a wide safety margin,
+/// while staying small enough that an attacker cannot exhaust host RAM by
+/// streaming a single crafted frame. Callers handling explicitly larger
+/// trusted blobs should call [`decompress_with_limit`] with a custom cap.
+pub const DEFAULT_MAX_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
+
 /// Create a compression error
 fn compression_error(msg: String) -> Error {
     anyhow::anyhow!("{}", msg)
@@ -105,18 +114,59 @@ pub fn compress(data: &[u8], algorithm: Algorithm, level: CompressionLevel) -> R
     Ok(compressed)
 }
 
-/// Decompress data using the specified algorithm
+/// Decompress data using the specified algorithm.
+///
+/// Uses the workspace default decompression cap of [`DEFAULT_MAX_DECOMPRESSED_SIZE`]
+/// to defend against compression-bomb attacks. Callers that need a different
+/// limit (or, for trusted internal data, a larger one) should use
+/// [`decompress_with_limit`] directly.
 #[instrument(skip(data))]
 pub fn decompress(data: &[u8], algorithm: Algorithm) -> Result<Vec<u8>> {
-    debug!("Decompressing {} bytes with {}", data.len(), algorithm.name());
+    decompress_with_limit(data, algorithm, DEFAULT_MAX_DECOMPRESSED_SIZE)
+}
+
+/// Decompress data with an explicit maximum-output cap.
+///
+/// SECURITY (CWE-409, decompression bomb): Both LZ4 and Zstd format
+/// streams can encode a tiny payload that expands to gigabytes when
+/// decompressed. Reading without a hard upper bound (`read_to_end` /
+/// `decode_all`) is exploitable for DoS by any peer that controls the
+/// compressed bytes.  We wrap each decoder in `.take(max_output as u64 + 1)`,
+/// which causes the read to stop one byte past the limit; if that final
+/// byte was actually consumed we know the producer wanted more than the
+/// cap and reject the stream with [`Error`].
+pub fn decompress_with_limit(
+    data: &[u8],
+    algorithm: Algorithm,
+    max_output: usize,
+) -> Result<Vec<u8>> {
+    debug!(
+        "Decompressing {} bytes with {} (cap {} bytes)",
+        data.len(),
+        algorithm.name(),
+        max_output
+    );
 
     let decompressed = match algorithm {
-        Algorithm::Lz4 => decompress_lz4(data)?,
-        Algorithm::Zstd => decompress_zstd(data)?,
-        Algorithm::None => data.to_vec(),
+        Algorithm::Lz4 => decompress_lz4(data, max_output)?,
+        Algorithm::Zstd => decompress_zstd(data, max_output)?,
+        Algorithm::None => {
+            if data.len() > max_output {
+                return Err(decompression_error(format!(
+                    "Decompressed size exceeds limit: {} > {}",
+                    data.len(),
+                    max_output
+                )));
+            }
+            data.to_vec()
+        }
     };
 
-    debug!("Decompressed {} bytes -> {} bytes", data.len(), decompressed.len());
+    debug!(
+        "Decompressed {} bytes -> {} bytes",
+        data.len(),
+        decompressed.len()
+    );
 
     Ok(decompressed)
 }
@@ -138,15 +188,26 @@ fn compress_lz4(data: &[u8]) -> Result<Vec<u8>> {
     Ok(compressed)
 }
 
-/// Decompress data using LZ4
-fn decompress_lz4(data: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = lz4::Decoder::new(data)
+/// Decompress data using LZ4, capped at `max_output` bytes.
+fn decompress_lz4(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
+    let decoder = lz4::Decoder::new(data)
         .map_err(|e| decompression_error(format!("LZ4 decoder error: {}", e)))?;
 
-    let mut decompressed = Vec::new();
-    decoder
+    // `take(max_output + 1)` lets us detect when the producer wants to write
+    // more than the cap: we read up to one extra byte; if it materialised,
+    // the stream was over-budget and we reject.
+    let mut limited = decoder.take(max_output as u64 + 1);
+    let mut decompressed = Vec::with_capacity(data.len().min(max_output));
+    limited
         .read_to_end(&mut decompressed)
         .map_err(|e| decompression_error(format!("LZ4 read error: {}", e)))?;
+
+    if decompressed.len() > max_output {
+        return Err(decompression_error(format!(
+            "LZ4 decompressed size exceeds limit: > {} bytes",
+            max_output
+        )));
+    }
 
     Ok(decompressed)
 }
@@ -157,10 +218,27 @@ fn compress_zstd(data: &[u8], level: CompressionLevel) -> Result<Vec<u8>> {
         .map_err(|e| compression_error(format!("Zstd compression error: {}", e)))
 }
 
-/// Decompress data using Zstandard
-fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
-    zstd::decode_all(data)
-        .map_err(|e| decompression_error(format!("Zstd decompression error: {}", e)))
+/// Decompress data using Zstandard, capped at `max_output` bytes.
+fn decompress_zstd(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
+    // Use the streaming Decoder so we can apply a hard read cap. Same
+    // `take(max_output + 1)` trick as LZ4 to detect overflow.
+    let decoder = zstd::stream::Decoder::new(data)
+        .map_err(|e| decompression_error(format!("Zstd decoder error: {}", e)))?;
+
+    let mut limited = decoder.take(max_output as u64 + 1);
+    let mut decompressed = Vec::with_capacity(data.len().min(max_output));
+    limited
+        .read_to_end(&mut decompressed)
+        .map_err(|e| decompression_error(format!("Zstd read error: {}", e)))?;
+
+    if decompressed.len() > max_output {
+        return Err(decompression_error(format!(
+            "Zstd decompressed size exceeds limit: > {} bytes",
+            max_output
+        )));
+    }
+
+    Ok(decompressed)
 }
 
 /// Calculate compression ratio
@@ -171,8 +249,13 @@ pub fn compression_ratio(original_size: usize, compressed_size: usize) -> f64 {
     original_size as f64 / compressed_size as f64
 }
 
-/// Estimate if compression is worthwhile
-pub fn should_compress(data: &[u8], min_size: usize, _min_ratio: f64) -> bool {
+/// Estimate if compression is worthwhile.
+///
+/// `min_ratio` is the minimum estimated compression ratio
+/// (`original / compressed`) required for the function to return `true`.
+/// We approximate the achievable ratio from byte-frequency entropy on a
+/// 1 KiB sample.
+pub fn should_compress(data: &[u8], min_size: usize, min_ratio: f64) -> bool {
     if data.len() < min_size {
         return false;
     }
@@ -190,9 +273,18 @@ pub fn should_compress(data: &[u8], min_size: usize, _min_ratio: f64) -> bool {
         }
     }
 
-    // If entropy is high (many unique bytes), compression likely won't help much
+    // If entropy is high (many unique bytes), compression likely won't help much.
+    // Map `min_ratio` to a maximum acceptable entropy: estimated ratio
+    // ~= 1 / entropy_ratio, so accept when entropy_ratio < 1 / min_ratio.
+    // Clamp at 0.9 so near-random data is never compressed regardless of
+    // a permissive min_ratio.
     let entropy_ratio = unique_count as f64 / 256.0;
-    entropy_ratio < 0.9 // Compress if entropy is below 90%
+    let entropy_ceiling = if min_ratio > 1.0 {
+        (1.0 / min_ratio).min(0.9)
+    } else {
+        0.9
+    };
+    entropy_ratio < entropy_ceiling
 }
 
 #[cfg(test)]
@@ -291,6 +383,40 @@ mod tests {
         // Both should decompress correctly
         assert_eq!(data, decompress(&lz4_compressed, Algorithm::Lz4).unwrap().as_slice());
         assert_eq!(data, decompress(&zstd_compressed, Algorithm::Zstd).unwrap().as_slice());
+    }
+
+    /// Decompression-bomb defence: a tiny Zstd frame whose decompressed size
+    /// vastly exceeds the supplied cap must be rejected, not allocated.
+    #[test]
+    fn test_zstd_decompression_bomb_rejected() {
+        // 16 MiB of zeros compresses to a few bytes with Zstd.
+        let original = vec![0u8; 16 * 1024 * 1024];
+        let bomb = compress(&original, Algorithm::Zstd, CompressionLevel::DEFAULT).unwrap();
+        assert!(bomb.len() < 1024, "test setup: bomb must be tiny");
+
+        // With a 1 MiB cap, decompression must fail rather than balloon RAM.
+        let err = decompress_with_limit(&bomb, Algorithm::Zstd, 1024 * 1024)
+            .expect_err("bomb must be rejected");
+        assert!(err.to_string().contains("exceeds limit"), "got: {err}");
+    }
+
+    #[test]
+    fn test_lz4_decompression_bomb_rejected() {
+        let original = vec![0u8; 16 * 1024 * 1024];
+        let bomb = compress(&original, Algorithm::Lz4, CompressionLevel::DEFAULT).unwrap();
+        assert!(bomb.len() < 1024 * 1024, "test setup: bomb must be far smaller than original");
+
+        let err = decompress_with_limit(&bomb, Algorithm::Lz4, 1024 * 1024)
+            .expect_err("bomb must be rejected");
+        assert!(err.to_string().contains("exceeds limit"), "got: {err}");
+    }
+
+    #[test]
+    fn test_within_limit_succeeds() {
+        let original = b"hello world".repeat(100);
+        let compressed = compress(&original, Algorithm::Zstd, CompressionLevel::DEFAULT).unwrap();
+        let out = decompress_with_limit(&compressed, Algorithm::Zstd, 1024 * 1024).unwrap();
+        assert_eq!(out, original);
     }
 }
 

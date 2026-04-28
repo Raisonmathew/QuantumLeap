@@ -1,7 +1,7 @@
 //! Configuration for Relay Service
 
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 /// Relay service configuration
@@ -44,7 +44,9 @@ pub struct WebSocketConfig {
 impl Default for WebSocketConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0:8080".parse().unwrap(),
+            // Use infallible constructor so a future refactor that
+            // mistypes the literal can't crash a binary at startup.
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080),
             max_message_size: 1024 * 1024, // 1MB
             ping_interval: Duration::from_secs(30),
             pong_timeout: Duration::from_secs(10),

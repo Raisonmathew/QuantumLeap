@@ -234,28 +234,37 @@ impl QuicBackend {
             quiche_config.enable_dgram(true, 1000, 1000);
         }
         
-        // Generate self-signed certificate for development
-        // In production, use proper CA-signed certificates
-        if let Ok((_cert, _key)) = Self::generate_self_signed_cert() {
-            // Note: quiche expects PEM format, but we're generating DER
-            // For now, disable peer verification for development
-            quiche_config.verify_peer(false);
-            debug!("Using self-signed certificate for development");
-        } else {
-            warn!("Failed to generate self-signed certificate, disabling peer verification");
-            quiche_config.verify_peer(false);
-        }
-        
+        // TLS / peer verification.
+        //
+        // SECURITY (CWE-295): Peer-certificate verification is ALWAYS on.
+        // The previous implementation toggled `verify_peer(false)` whenever
+        // either `cfg!(debug_assertions)` was true OR the runtime env var
+        // `QLTP_DEV_MODE` was set to a truthy value. Both conditions are
+        // reachable in shipped binaries (debug builds and env-var-set
+        // production runs), so the safety net was effectively user-controlled
+        // and trivially defeated MITM protection. Both knobs have been
+        // removed; tests that need a no-verify peer must construct their own
+        // `quiche::Config` with `verify_peer(false)` explicitly.
+        quiche_config.verify_peer(true);
+
         quiche_config
     }
 
-    /// Check if handshake is complete and handle timeout
+    /// Check if handshake is complete and handle timeout.
+    ///
+    /// On a fired timeout this method also marks the QUIC connection as
+    /// closed via `quiche::Connection::close()` and flips
+    /// `session.state` to `Failed` so the surrounding
+    /// `state.sessions` entry can be removed by the caller. Without this
+    /// step the half-open connection (and its UDP socket) leaked across
+    /// every retry, eventually exhausting file descriptors and the
+    /// session map.
     fn check_handshake_status(session: &mut QuicSession, config: &QuicConfig) -> Result<bool> {
         if session.handshake_complete {
             return Ok(true);
         }
 
-        if let Some(conn) = &session.connection {
+        if let Some(conn) = &mut session.connection {
             // Check if connection is established
             if conn.is_established() {
                 session.handshake_complete = true;
@@ -268,6 +277,13 @@ impl QuicBackend {
             if let Some(start) = session.handshake_start {
                 let elapsed = start.elapsed().as_secs();
                 if elapsed > config.handshake_timeout_secs {
+                    // RELIABILITY: actively close the half-open connection
+                    // so quiche releases its internal state, and mark the
+                    // session Failed so the manager evicts it. Errors from
+                    // close are intentionally swallowed — we are tearing
+                    // down anyway.
+                    let _ = conn.close(true, 0x00, b"handshake timeout");
+                    session.state = SessionState::Failed;
                     return Err(Error::Timeout(format!(
                         "QUIC handshake timeout after {} seconds",
                         elapsed
@@ -281,19 +297,18 @@ impl QuicBackend {
 
     /// Calculate RTT from connection statistics
     fn calculate_rtt(session: &QuicSession) -> u64 {
-        // Calculate from our collected samples
+        // Prefer our collected samples (already in milliseconds).
         if !session.rtt_samples.is_empty() {
             let sum: u64 = session.rtt_samples.iter().sum();
             return sum / session.rtt_samples.len() as u64;
         }
-        
-        // Fallback: estimate from connection stats if available
-        if let Some(conn) = &session.connection {
-            let stats = conn.stats();
-            // Use sent_bytes as a rough proxy (not accurate but better than 0)
-            if stats.sent > 0 {
-                return (stats.sent_bytes / (stats.sent as u64).max(1)) / 100; // Rough estimate in ms
-            }
+
+        // Fallback: until we have real samples, return a conservative
+        // 100 ms default. The previous implementation divided sent_bytes by
+        // packet count and called that "ms", which was dimensionally wrong
+        // and produced absurd values that polluted scheduling decisions.
+        if session.connection.is_some() {
+            return 100;
         }
         0
     }
@@ -339,36 +354,21 @@ impl QuicBackend {
         Ok(())
     }
 
-    /// Generate self-signed certificate for development
-    /// In production, use proper certificate management with CA-signed certificates
+    /// Generate a self-signed certificate.
+    ///
+    /// **Removed**: the previous implementation returned hand-rolled bytes
+    /// that were *not* a valid X.509 certificate. Producing a real
+    /// certificate requires a dependency such as `rcgen`, which we do not
+    /// pull in by default. This function is kept as an explicit error so any
+    /// caller still relying on it gets a clear message instead of bogus
+    /// bytes silently disabling peer verification.
+    #[allow(dead_code)]
     fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>)> {
-        use ring::rand::SystemRandom;
-        use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-        
-        let rng = SystemRandom::new();
-        
-        // Generate ECDSA P-256 key pair
-        let pkcs8_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
-            .map_err(|e| Error::Tls(format!("Failed to generate key pair: {:?}", e)))?;
-        
-        let _key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8_bytes.as_ref(), &rng)
-            .map_err(|e| Error::Tls(format!("Failed to parse key pair: {:?}", e)))?;
-        
-        // Create a minimal self-signed certificate
-        // This is a simplified version for development only
-        // Production should use rcgen or similar for proper X.509 certificates
-        let key = pkcs8_bytes.as_ref().to_vec();
-        
-        // Minimal DER-encoded certificate structure (placeholder)
-        // In production, use rcgen to generate proper X.509 certificates
-        let cert = vec![
-            0x30, 0x82, 0x01, 0x00, // SEQUENCE
-            // ... (simplified for development)
-        ];
-        
-        info!("Generated self-signed certificate for development (NOT FOR PRODUCTION)");
-        
-        Ok((cert, key))
+        Err(Error::Tls(
+            "Self-signed certificate generation is not built in. Configure a real \
+             certificate via load_cert_and_key. Peer verification is mandatory."
+                .to_string(),
+        ))
     }
 
     /// Load certificate and key from files (for production)
@@ -561,7 +561,18 @@ impl TransportBackend for QuicBackend {
         }
 
         // Check handshake status
-        let handshake_complete = Self::check_handshake_status(session, &self.config)?;
+        let handshake_complete = match Self::check_handshake_status(session, &self.config) {
+            Ok(v) => v,
+            Err(e) => {
+                // RELIABILITY: handshake-timeout sets session.state =
+                // Failed inside `check_handshake_status`. Evict the
+                // entry now so a subsequent send/receive doesn't keep
+                // hitting the same dead session, and so the UDP socket
+                // is dropped.
+                state.sessions.remove(&session_id);
+                return Err(e);
+            }
+        };
         if !handshake_complete {
             return Err(Error::Connection("QUIC handshake not complete".to_string()));
         }

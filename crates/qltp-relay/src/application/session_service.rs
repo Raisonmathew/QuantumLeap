@@ -63,7 +63,7 @@ impl SessionService {
 
     /// Create a new session between two peers
     pub fn create_session(&self, request: CreateSessionRequest) -> Result<SessionId> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = Session::new(request.initiator_id, request.responder_id);
         let session_id = session.id().clone();
@@ -75,7 +75,7 @@ impl SessionService {
 
     /// Get a session by ID
     pub fn get_session(&self, session_id: &SessionId) -> Result<Session> {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
 
         sessions
             .get(session_id)
@@ -85,7 +85,7 @@ impl SessionService {
 
     /// Start gathering ICE candidates for a session
     pub fn start_gathering(&self, session_id: &SessionId) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -97,7 +97,7 @@ impl SessionService {
 
     /// Start exchanging ICE candidates
     pub fn start_exchanging(&self, session_id: &SessionId) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -109,7 +109,7 @@ impl SessionService {
 
     /// Start connectivity check
     pub fn start_connectivity_check(&self, session_id: &SessionId) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -125,7 +125,7 @@ impl SessionService {
         session_id: &SessionId,
         candidate: IceCandidate,
     ) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -141,7 +141,7 @@ impl SessionService {
         session_id: &SessionId,
         candidate: IceCandidate,
     ) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -153,7 +153,7 @@ impl SessionService {
 
     /// Get initiator candidates
     pub fn get_initiator_candidates(&self, session_id: &SessionId) -> Result<Vec<IceCandidate>> {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get(session_id)
@@ -164,7 +164,7 @@ impl SessionService {
 
     /// Get responder candidates
     pub fn get_responder_candidates(&self, session_id: &SessionId) -> Result<Vec<IceCandidate>> {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get(session_id)
@@ -181,7 +181,7 @@ impl SessionService {
         initiator_candidate: IceCandidate,
         responder_candidate: IceCandidate,
     ) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -193,7 +193,7 @@ impl SessionService {
 
     /// Close a session
     pub fn close_session(&self, session_id: &SessionId) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -205,7 +205,7 @@ impl SessionService {
 
     /// Mark session as closed
     pub fn mark_closed(&self, session_id: &SessionId) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -217,7 +217,7 @@ impl SessionService {
 
     /// Fail a session
     pub fn fail_session(&self, session_id: &SessionId, error: String) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -229,7 +229,7 @@ impl SessionService {
 
     /// Remove a session
     pub fn remove_session(&self, session_id: &SessionId) -> Result<Session> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         sessions
             .remove(session_id)
@@ -238,7 +238,7 @@ impl SessionService {
 
     /// Update session activity
     pub fn update_activity(&self, session_id: &SessionId) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -250,7 +250,7 @@ impl SessionService {
 
     /// Add bytes transferred
     pub fn add_bytes_transferred(&self, session_id: &SessionId, bytes: u64) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -262,7 +262,7 @@ impl SessionService {
 
     /// Increment connection attempts
     pub fn increment_attempts(&self, session_id: &SessionId) -> Result<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get_mut(session_id)
@@ -274,7 +274,7 @@ impl SessionService {
 
     /// Get all active sessions
     pub fn get_active_sessions(&self) -> Vec<Session> {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         sessions
             .values()
             .filter(|s| s.is_active())
@@ -284,7 +284,7 @@ impl SessionService {
 
     /// Get all established sessions
     pub fn get_established_sessions(&self) -> Vec<Session> {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         sessions
             .values()
             .filter(|s| s.is_established())
@@ -294,7 +294,7 @@ impl SessionService {
 
     /// Get sessions for a specific peer
     pub fn get_peer_sessions(&self, peer_id: &PeerId) -> Vec<Session> {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         sessions
             .values()
             .filter(|s| s.involves_peer(peer_id))
@@ -304,19 +304,19 @@ impl SessionService {
 
     /// Get session count
     pub fn session_count(&self) -> usize {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         sessions.len()
     }
 
     /// Get active session count
     pub fn active_session_count(&self) -> usize {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         sessions.values().filter(|s| s.is_active()).count()
     }
 
     /// Clean up timed out sessions
     pub fn cleanup_timed_out_sessions(&self) -> Vec<SessionId> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
         let mut timed_out = Vec::new();
 
         // Find timed out sessions
@@ -339,7 +339,7 @@ impl SessionService {
 
     /// Get session statistics
     pub fn get_session_stats(&self, session_id: &SessionId) -> Result<SessionStats> {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
 
         let session = sessions
             .get(session_id)

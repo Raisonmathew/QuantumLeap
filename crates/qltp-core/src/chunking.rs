@@ -70,17 +70,46 @@ pub struct ContentDefinedChunker {
     avg_chunk_size: usize,
     max_chunk_size: usize,
     mask: u64,
+    /// Hard upper bound on the in-memory buffer used while chunking a file.
+    /// Files larger than this are streamed in passes; without this cap a
+    /// caller could OOM the host by feeding an arbitrarily large file
+    /// (CWE-770).
+    max_in_memory_bytes: u64,
 }
 
 impl ContentDefinedChunker {
-    /// Create a new content-defined chunker
+    /// Default in-memory chunking budget: 256 MiB.
+    pub const DEFAULT_MAX_IN_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// Create a new content-defined chunker.
+    ///
+    /// `avg_chunk_size` MUST be a power of two; otherwise the rolling-hash
+    /// boundary mask degenerates to 0 and every byte becomes a chunk
+    /// boundary. We assert this in debug builds and clamp to the next power
+    /// of two in release builds.
     pub fn new(avg_chunk_size: usize) -> Self {
+        debug_assert!(
+            avg_chunk_size.is_power_of_two(),
+            "avg_chunk_size must be a power of two, got {avg_chunk_size}"
+        );
+        let normalized = if avg_chunk_size.is_power_of_two() {
+            avg_chunk_size
+        } else {
+            avg_chunk_size.next_power_of_two()
+        };
         Self {
-            min_chunk_size: avg_chunk_size / 4,
-            avg_chunk_size,
-            max_chunk_size: avg_chunk_size * 4,
-            mask: (1 << (avg_chunk_size.trailing_zeros())) - 1,
+            min_chunk_size: normalized / 4,
+            avg_chunk_size: normalized,
+            max_chunk_size: normalized * 4,
+            mask: (normalized as u64) - 1,
+            max_in_memory_bytes: Self::DEFAULT_MAX_IN_MEMORY_BYTES,
         }
+    }
+
+    /// Override the maximum file size this chunker will load into RAM.
+    pub fn with_max_in_memory_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_in_memory_bytes = max_bytes;
+        self
     }
 
     /// Chunk a file using content-defined chunking
@@ -91,6 +120,18 @@ impl ContentDefinedChunker {
         let metadata = file.metadata().await?;
         let file_size = metadata.len();
 
+        // SECURITY (CWE-770): refuse to load files larger than our cap into
+        // memory. Production callers handling huge files should use the
+        // fixed-size chunker (`split_into_chunks`) which streams without
+        // buffering the whole file.
+        if file_size > self.max_in_memory_bytes {
+            return Err(crate::error::Error::Other(format!(
+                "ContentDefinedChunker: file size {} exceeds in-memory cap {} bytes; \
+                 use fixed-size chunking for files this large",
+                file_size, self.max_in_memory_bytes
+            )));
+        }
+
         debug!(
             "Content-defined chunking: {} ({} bytes, avg_chunk: {})",
             path.display(),
@@ -100,11 +141,11 @@ impl ContentDefinedChunker {
 
         let mut chunks = Vec::new();
         let _offset = 0u64;
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::with_capacity(file_size as usize);
         let mut rolling_hash = 0u64;
         let mut chunk_start = 0u64;
 
-        // Read entire file (for simplicity; in production, use streaming)
+        // Bounded read: file_size was checked above against max_in_memory_bytes.
         file.read_to_end(&mut buffer).await?;
 
         for (i, &byte) in buffer.iter().enumerate() {

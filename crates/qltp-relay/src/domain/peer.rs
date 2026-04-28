@@ -169,6 +169,13 @@ impl Peer {
 
     /// Add ICE candidate
     pub fn add_ice_candidate(&mut self, candidate: IceCandidate) {
+        // SECURITY: cap candidate count per peer. See `Session::add_*
+        // _candidate` for full rationale; identical bound applies here
+        // to defend against signaling-fed memory growth.
+        const MAX_CANDIDATES_PER_PEER: usize = 256;
+        if self.ice_candidates.len() >= MAX_CANDIDATES_PER_PEER {
+            return;
+        }
         // Avoid duplicates
         if !self.ice_candidates.contains(&candidate) {
             self.ice_candidates.push(candidate);

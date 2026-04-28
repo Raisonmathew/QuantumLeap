@@ -269,8 +269,11 @@ impl Engine {
             use_compression,
             use_dedup,
             use_delta: options.delta_encoding,
-            use_neural: false,     // TODO: Implement neural compression
-            use_prefetch: false,   // TODO: Implement prefetching
+            // Neural compression and prefetch are not implemented in this
+            // build. Surfaced as `false` so downstream code can be honest
+            // about what is actually being applied.
+            use_neural: false,
+            use_prefetch: false,
             chunk_size: self.config.chunk_size,
         }
     }

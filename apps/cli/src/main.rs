@@ -6,6 +6,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use qltp_core::{chunking, Engine, TransferOptions};
+use qltp_transport::application::TransportManagerConfig;
+use qltp_transport::domain::TransportType;
 use std::path::PathBuf;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -49,6 +51,15 @@ enum Commands {
         /// Enable encryption
         #[arg(short, long)]
         encrypt: bool,
+
+        /// Force a specific transport backend (tcp, quic, io_uring).
+        /// Falls back to auto-selection if omitted.
+        #[arg(long, value_name = "BACKEND")]
+        transport: Option<String>,
+
+        /// Print transport metrics after the transfer completes.
+        #[arg(long)]
+        show_stats: bool,
     },
 
     /// Analyze a file and show chunking information
@@ -68,11 +79,25 @@ enum Commands {
     /// Show version and system information
     Info,
 
+    /// Inspect available transport backends on this machine
+    Backends {
+        #[command(subcommand)]
+        command: BackendCommands,
+    },
+
     /// License management commands
     License {
         #[command(subcommand)]
         command: LicenseCommands,
     },
+}
+
+#[derive(Subcommand)]
+enum BackendCommands {
+    /// List transport backends that can be built and used here
+    List,
+    /// Show live metrics from the active transport backend
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -147,8 +172,19 @@ async fn main() -> Result<()> {
             no_compression,
             no_dedup,
             encrypt,
+            transport,
+            show_stats,
         } => {
-            transfer_file(source, destination, no_compression, no_dedup, encrypt).await?;
+            transfer_file(
+                source,
+                destination,
+                no_compression,
+                no_dedup,
+                encrypt,
+                transport,
+                show_stats,
+            )
+            .await?;
         }
         Commands::Analyze {
             file,
@@ -160,6 +196,10 @@ async fn main() -> Result<()> {
         Commands::Info => {
             show_info();
         }
+        Commands::Backends { command } => match command {
+            BackendCommands::List => list_backends().await?,
+            BackendCommands::Stats => show_backend_stats().await?,
+        },
         Commands::License { command } => match command {
             LicenseCommands::Create { tier, email } => {
                 license::create_license(&tier, email).await?;
@@ -188,10 +228,15 @@ async fn transfer_file(
     no_compression: bool,
     no_dedup: bool,
     encrypt: bool,
+    transport: Option<String>,
+    show_stats: bool,
 ) -> Result<()> {
-    println!("🚀 QLTP Transfer");
+    println!("\u{1F680} QLTP Transfer");
     println!("Source: {}", source.display());
     println!("Destination: {}", destination);
+    if let Some(ref t) = transport {
+        println!("Transport (forced): {}", t);
+    }
     println!();
 
     // Check if source file exists
@@ -214,7 +259,16 @@ async fn transfer_file(
     );
 
     // Create engine and options
-    let engine = Engine::new().await?;
+    let engine = if let Some(name) = transport {
+        let t = parse_transport(&name)?;
+        let cfg = TransportManagerConfig {
+            preferred_transport: Some(t),
+            ..Default::default()
+        };
+        Engine::with_transport_config(Default::default(), cfg).await?
+    } else {
+        Engine::new().await?
+    };
     let options = TransferOptions {
         compression: !no_compression,
         deduplication: !no_dedup,
@@ -242,8 +296,69 @@ async fn transfer_file(
     // Show storage stats
     let stats = engine.storage_stats().await;
     println!("Storage: {} chunks, {:.2} MB total", stats.chunk_count, stats.total_size as f64 / 1024.0 / 1024.0);
+
+    if show_stats {
+        println!();
+        if let Some(t) = engine.current_backend().await {
+            println!("Active backend: {}", t);
+        }
+        if let Some(metrics) = engine.transport_metrics().await {
+            println!("Transport metrics: {:?}", metrics);
+        } else {
+            println!("No transport metrics yet (no remote send/receive happened).");
+        }
+    }
     println!();
 
+    Ok(())
+}
+
+fn parse_transport(name: &str) -> Result<TransportType> {
+    match name.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(TransportType::Tcp),
+        "quic" => Ok(TransportType::Quic),
+        "io_uring" | "iouring" | "io-uring" => Ok(TransportType::IoUring),
+        "dpdk" => Ok(TransportType::Dpdk),
+        other => Err(anyhow::anyhow!(
+            "Unknown transport `{}`. Try one of: tcp, quic, io_uring",
+            other
+        )),
+    }
+}
+
+async fn list_backends() -> Result<()> {
+    println!("\u{1F4E1} Transport Backends");
+    println!("\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}");
+    let buildable = qltp_transport::application::buildable_transports();
+    for t in buildable {
+        let caps = qltp_transport::domain::BackendCapabilities::for_transport(t);
+        println!(
+            "  {:<10} max throughput: {:.2} GB/s",
+            t.to_string(),
+            caps.max_throughput_gbps()
+        );
+    }
+    println!();
+    println!("Note: io_uring is only available on Linux when built with the `io_uring` feature.");
+    Ok(())
+}
+
+async fn show_backend_stats() -> Result<()> {
+    let engine = Engine::new().await?;
+    if let Some(t) = engine.current_backend().await {
+        println!("Active backend: {}", t);
+    } else {
+        println!("No backend active.");
+        return Ok(());
+    }
+    match engine.transport_metrics().await {
+        Some(m) => println!("Metrics: {:?}", m),
+        None => println!("No metrics recorded yet."),
+    }
+    match engine.transport_health().await {
+        Ok(h) => println!("Health: {:?}", h),
+        Err(e) => println!("Health check failed: {}", e),
+    }
     Ok(())
 }
 

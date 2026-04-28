@@ -13,6 +13,57 @@ use crate::{
     ports::{PeerRepository, SessionRepository, ConnectionRepository},
 };
 
+/// Maximum number of OCC retries before giving up and surfacing the conflict.
+///
+/// Chosen to absorb realistic concurrent contention on a single session
+/// (typically 2-3 racers from duplicate signaling deliveries) while still
+/// bounding the worst-case latency at O(MAX_OCC_RETRIES * single_op_latency).
+const MAX_OCC_RETRIES: usize = 8;
+
+/// Apply a mutation to a session under optimistic concurrency control.
+///
+/// This is the standard "load -> mutate -> CAS commit -> retry on conflict"
+/// loop used by JPA `@Version`, DynamoDB conditional writes, Etcd revisions,
+/// and similar OCC systems. The mutation closure runs against the latest
+/// snapshot every retry, so even non-idempotent transitions (counters,
+/// monotonic state machines) compose correctly.
+///
+/// Returns the persisted session on success. Returns `Error::Conflict` only
+/// after exhausting `MAX_OCC_RETRIES`, which indicates pathological
+/// contention rather than a normal duplicate-delivery race.
+async fn update_session_with_retry<F>(
+    repo: &dyn SessionRepository,
+    id: &SessionId,
+    mut mutate: F,
+) -> Result<Session>
+where
+    F: FnMut(&mut Session) -> Result<()>,
+{
+    for attempt in 0..MAX_OCC_RETRIES {
+        let mut session = repo
+            .find_by_id(id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("Session {}", id.as_uuid())))?;
+        let expected_version = session.version();
+        mutate(&mut session)?;
+        match repo.update_if_unchanged(&session, expected_version).await {
+            Ok(()) => return Ok(session),
+            Err(Error::Conflict(_)) if attempt + 1 < MAX_OCC_RETRIES => {
+                // Lost the CAS race; reload and try again. No backoff needed:
+                // the contended path is in-memory and short, and the producer
+                // of the conflict has already committed its work.
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::Conflict(format!(
+        "Session {} could not be updated after {} OCC retries",
+        id.as_uuid(),
+        MAX_OCC_RETRIES
+    )))
+}
+
 /// Message handler that routes signaling messages to appropriate repositories
 pub struct MessageHandler {
     peer_repo: Arc<dyn PeerRepository>,
@@ -69,20 +120,27 @@ impl MessageHandler {
                 })
             }
             SignalingMessage::AcceptSession { session_id, responder_id } => {
-                let mut session = self.session_repo.find_by_id(&SessionId::from(session_id)).await?
-                    .ok_or(Error::NotFound(format!("Session {}", session_id)))?;
-                
-                // Start gathering candidates (accept the session)
-                session.start_gathering();
-                self.session_repo.save(&session).await?;
-                
+                // Concurrency-safe state transition via OCC.
+                //
+                // Two simultaneous `AcceptSession` messages for the same
+                // session_id used to race here (load -> mutate -> save with no
+                // serialization point). We now load the session, mutate locally,
+                // and commit through `update_if_unchanged`, which is an atomic
+                // compare-and-swap at the repository layer. On version
+                // mismatch we reload and retry up to MAX_OCC_RETRIES times.
+                update_session_with_retry(
+                    self.session_repo.as_ref(),
+                    &SessionId::from(session_id),
+                    |s| { s.start_gathering(); Ok(()) },
+                ).await?;
+
                 let responder = self.peer_repo.find_by_id(&PeerId::from(responder_id)).await?
                     .ok_or(Error::NotFound(format!("Peer {}", responder_id)))?;
-                
+
                 let responder_addr = responder.signaling_address()
                     .ok_or(Error::InvalidState("Responder has no signaling address".to_string()))?;
                 let responder_nat = responder.capabilities().nat_type();
-                
+
                 Ok(SignalingResponse::SessionAccepted {
                     session_id,
                     responder_id,
@@ -91,13 +149,16 @@ impl MessageHandler {
                 })
             }
             SignalingMessage::RejectSession { session_id, reason, .. } => {
-                let mut session = self.session_repo.find_by_id(&SessionId::from(session_id)).await?
-                    .ok_or(Error::NotFound(format!("Session {}", session_id)))?;
-                
-                // Mark session as failed (reject it)
-                session.fail(reason.clone());
-                self.session_repo.save(&session).await?;
-                
+                // Same OCC pattern as AcceptSession - guards against duplicate
+                // RejectSession messages racing with each other or with an
+                // AcceptSession that arrives in the same tick.
+                let reason_for_mut = reason.clone();
+                update_session_with_retry(
+                    self.session_repo.as_ref(),
+                    &SessionId::from(session_id),
+                    move |s| { s.fail(reason_for_mut.clone()); Ok(()) },
+                ).await?;
+
                 Ok(SignalingResponse::SessionRejected { session_id, reason })
             }
             SignalingMessage::InitiateConnection { session_id, local_peer_id, remote_peer_id } => {
@@ -184,6 +245,7 @@ impl MessageHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::nat_type::NatType;
     use crate::infrastructure::{
         InMemoryPeerRepository, InMemorySessionRepository, InMemoryConnectionRepository,
     };
@@ -289,6 +351,100 @@ mod tests {
 
         let result = handler.handle_message(message).await;
         assert!(result.is_err());
+    }
+
+    /// Stress test: prove that under heavy concurrent contention on the same
+    /// session id, every increment is observed (no lost updates) and the
+    /// final OCC version matches the number of successful commits. This is
+    /// the property the doc-only fix could not give us.
+    #[tokio::test]
+    async fn test_occ_no_lost_updates_under_concurrency() {
+        use crate::domain::{Peer, PeerCapabilities, Session};
+        use tokio::task::JoinSet;
+
+        let session_repo: Arc<dyn SessionRepository> =
+            Arc::new(InMemorySessionRepository::new());
+
+        // Seed a session.
+        let initiator = PeerId::new();
+        let responder = PeerId::new();
+        let session = Session::new(initiator, responder);
+        let session_id = session.id().clone();
+        let starting_version = session.version();
+        session_repo.save(&session).await.unwrap();
+
+        // 32 concurrent writers each apply a non-idempotent state mutation
+        // (incrementing connection_attempts via `increment_attempts`).
+        const N_WRITERS: u32 = 32;
+        let mut set = JoinSet::new();
+        for _ in 0..N_WRITERS {
+            let repo = session_repo.clone();
+            let id = session_id.clone();
+            set.spawn(async move {
+                update_session_with_retry(repo.as_ref(), &id, |s| {
+                    s.increment_attempts();
+                    Ok(())
+                })
+                .await
+            });
+        }
+
+        let mut successes = 0u32;
+        while let Some(res) = set.join_next().await {
+            res.unwrap().expect("OCC retry must eventually succeed under bounded contention");
+            successes += 1;
+        }
+        assert_eq!(successes, N_WRITERS);
+
+        // Every successful commit must be reflected: connection_attempts and
+        // the OCC version both advanced by exactly N_WRITERS.
+        let final_session = session_repo
+            .find_by_id(&session_id)
+            .await
+            .unwrap()
+            .expect("session must still exist");
+        assert_eq!(
+            final_session.connection_attempts(),
+            N_WRITERS,
+            "non-idempotent mutation must compose exactly once per writer"
+        );
+        assert_eq!(
+            final_session.version(),
+            starting_version + N_WRITERS as u64,
+            "OCC version must advance once per successful CAS"
+        );
+
+        // Silence unused warnings for repo types only used by this test path.
+        let _ = (Peer::new(PeerId::new(), PeerCapabilities::new(NatType::FullCone, "1.0".into())),);
+    }
+
+    /// Direct CAS test: a stale write (wrong expected_version) must be
+    /// rejected with `Error::Conflict` and must not mutate state.
+    #[tokio::test]
+    async fn test_update_if_unchanged_rejects_stale_write() {
+        use crate::domain::Session;
+
+        let repo: Arc<dyn SessionRepository> = Arc::new(InMemorySessionRepository::new());
+        let mut session = Session::new(PeerId::new(), PeerId::new());
+        repo.save(&session).await.unwrap();
+        let v0 = session.version();
+
+        // First writer commits at v0.
+        let mut writer_a = session.clone();
+        writer_a.increment_attempts();
+        repo.update_if_unchanged(&writer_a, v0).await.expect("first writer wins");
+
+        // Second writer also held v0; commit must be rejected.
+        session.increment_attempts();
+        let err = repo
+            .update_if_unchanged(&session, v0)
+            .await
+            .expect_err("stale write must be rejected");
+        assert!(matches!(err, Error::Conflict(_)), "got {err:?}");
+
+        // Stored state must still be writer_a's commit, not the stale write.
+        let stored = repo.find_by_id(session.id()).await.unwrap().unwrap();
+        assert_eq!(stored.connection_attempts(), 1);
     }
 }
 

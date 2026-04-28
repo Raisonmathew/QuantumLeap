@@ -51,7 +51,7 @@ pub mod adapters;
 pub mod error;
 
 // Re-export main types for convenience
-pub use domain::{AuthToken, Credentials, Session};
+pub use domain::{AuthToken, Credentials, RateLimitConfig, RateLimited, RateLimiter, Session};
 pub use application::{AuthService, SessionInfo};
 pub use ports::SessionStore;
 pub use adapters::MemorySessionStore;

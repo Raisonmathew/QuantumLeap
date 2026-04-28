@@ -63,7 +63,7 @@ impl PeerService {
 
     /// Register a new peer
     pub fn register_peer(&self, request: RegisterPeerRequest) -> Result<PeerId> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
 
         // Check if peer already exists
         if peers.contains_key(&request.peer_id) {
@@ -89,7 +89,7 @@ impl PeerService {
         capabilities: PeerCapabilities,
         signaling_address: SocketAddr,
     ) -> Result<PeerId> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
 
         if peers.contains_key(&peer_id) {
             return Err(PeerServiceError::PeerAlreadyExists(peer_id));
@@ -106,7 +106,7 @@ impl PeerService {
 
     /// Connect a peer (transition to connected state)
     pub fn connect_peer(&self, peer_id: &PeerId) -> Result<()> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
 
         let peer = peers
             .get_mut(peer_id)
@@ -118,7 +118,7 @@ impl PeerService {
 
     /// Disconnect a peer
     pub fn disconnect_peer(&self, peer_id: &PeerId) -> Result<()> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
 
         let peer = peers
             .get_mut(peer_id)
@@ -130,7 +130,7 @@ impl PeerService {
 
     /// Remove a peer from the registry
     pub fn remove_peer(&self, peer_id: &PeerId) -> Result<Peer> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
 
         peers
             .remove(peer_id)
@@ -139,7 +139,7 @@ impl PeerService {
 
     /// Get a peer by ID
     pub fn get_peer(&self, peer_id: &PeerId) -> Result<Peer> {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
 
         peers
             .get(peer_id)
@@ -149,7 +149,7 @@ impl PeerService {
 
     /// Add ICE candidate to a peer
     pub fn add_ice_candidate(&self, peer_id: &PeerId, candidate: IceCandidate) -> Result<()> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
 
         let peer = peers
             .get_mut(peer_id)
@@ -165,7 +165,7 @@ impl PeerService {
         peer_id: &PeerId,
         candidates: Vec<IceCandidate>,
     ) -> Result<()> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
 
         let peer = peers
             .get_mut(peer_id)
@@ -177,7 +177,7 @@ impl PeerService {
 
     /// Get ICE candidates for a peer
     pub fn get_ice_candidates(&self, peer_id: &PeerId) -> Result<Vec<IceCandidate>> {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
 
         let peer = peers
             .get(peer_id)
@@ -188,7 +188,7 @@ impl PeerService {
 
     /// Check if two peers can connect
     pub fn can_peers_connect(&self, peer1_id: &PeerId, peer2_id: &PeerId) -> Result<bool> {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
 
         let peer1 = peers
             .get(peer1_id)
@@ -203,7 +203,7 @@ impl PeerService {
 
     /// Get all active peers
     pub fn get_active_peers(&self) -> Vec<Peer> {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
         peers
             .values()
             .filter(|p| p.is_active())
@@ -213,7 +213,7 @@ impl PeerService {
 
     /// Get all connected peers
     pub fn get_connected_peers(&self) -> Vec<Peer> {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
         peers
             .values()
             .filter(|p| p.is_connected())
@@ -223,19 +223,19 @@ impl PeerService {
 
     /// Get peer count
     pub fn peer_count(&self) -> usize {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
         peers.len()
     }
 
     /// Get active peer count
     pub fn active_peer_count(&self) -> usize {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
         peers.values().filter(|p| p.is_active()).count()
     }
 
     /// Update peer activity timestamp
     pub fn update_peer_activity(&self, peer_id: &PeerId) -> Result<()> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
 
         let peer = peers
             .get_mut(peer_id)
@@ -247,7 +247,7 @@ impl PeerService {
 
     /// Increment session count for a peer
     pub fn increment_peer_sessions(&self, peer_id: &PeerId) -> Result<()> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
 
         let peer = peers
             .get_mut(peer_id)
@@ -259,7 +259,7 @@ impl PeerService {
 
     /// Decrement session count for a peer
     pub fn decrement_peer_sessions(&self, peer_id: &PeerId) -> Result<()> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
 
         let peer = peers
             .get_mut(peer_id)
@@ -271,7 +271,7 @@ impl PeerService {
 
     /// Add bytes transferred for a peer
     pub fn add_peer_bytes_transferred(&self, peer_id: &PeerId, bytes: u64) -> Result<()> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
 
         let peer = peers
             .get_mut(peer_id)
@@ -283,7 +283,7 @@ impl PeerService {
 
     /// Clean up timed out peers
     pub fn cleanup_timed_out_peers(&self) -> Vec<PeerId> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
         let mut timed_out = Vec::new();
 
         // Find timed out peers
@@ -306,7 +306,7 @@ impl PeerService {
 
     /// Find compatible peers for a given peer
     pub fn find_compatible_peers(&self, peer_id: &PeerId) -> Result<Vec<PeerId>> {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
 
         let source_peer = peers
             .get(peer_id)
@@ -325,7 +325,7 @@ impl PeerService {
 
     /// Get peer statistics
     pub fn get_peer_stats(&self, peer_id: &PeerId) -> Result<PeerStats> {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
 
         let peer = peers
             .get(peer_id)
@@ -356,6 +356,8 @@ pub struct PeerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::nat_type::NatType;
+    use crate::domain::peer_capabilities::TransportProtocol;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn create_test_service() -> PeerService {

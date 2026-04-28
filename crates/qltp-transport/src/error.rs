@@ -12,6 +12,7 @@ use thiserror::Error;
 
 /// Unified transport layer errors
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     // ============================================================================
     // Domain Errors - Business logic and state management

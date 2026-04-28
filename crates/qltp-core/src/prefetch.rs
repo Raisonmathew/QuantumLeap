@@ -155,7 +155,17 @@ impl Prefetcher {
 
         // Filter by confidence and limit count
         predictions.retain(|p| p.confidence >= self.config.min_confidence);
-        predictions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        // CORRECTNESS: previously this used `.unwrap()`, which panics if
+        // any `confidence` field is NaN. Confidence values flow from
+        // arithmetic on observed access stats, so a divide-by-zero or a
+        // 0/0 input could turn a routine prefetch into a process-wide
+        // panic. Treat unorderable pairs as Equal — the pair's relative
+        // position is unstable but the program survives.
+        predictions.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         predictions.truncate(self.config.max_prefetch_chunks);
 
         // Update stats
@@ -231,8 +241,24 @@ impl Prefetcher {
         if let Some(stride) = self.detect_stride(&pattern) {
             let mut predictions = Vec::new();
             for i in 1..=self.config.window_size {
+                // CORRECTNESS: `stride` and `i` are both `usize` (=u64 on
+                // 64-bit platforms). On 32-bit hosts, or for very large
+                // strides on 64-bit, `stride * i` can wrap silently and
+                // produce a chunk_id that points at the wrong region.
+                // Same hazard for `current_chunk + offset`. Use checked
+                // arithmetic and bail out of the prediction loop on the
+                // first overflow — a missed prefetch is harmless; a
+                // wrong-region prefetch isn't.
+                let offset = match (stride as u64).checked_mul(i as u64) {
+                    Some(v) => v,
+                    None => break,
+                };
+                let chunk_id = match current_chunk.checked_add(offset) {
+                    Some(v) => v,
+                    None => break,
+                };
                 predictions.push(Prediction {
-                    chunk_id: current_chunk + (stride * i) as u64,
+                    chunk_id,
                     confidence: 0.85,
                     pattern: AccessPattern::Strided(stride),
                 });

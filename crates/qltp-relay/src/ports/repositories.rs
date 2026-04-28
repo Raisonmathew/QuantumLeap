@@ -65,6 +65,44 @@ pub trait SessionRepository: Send + Sync {
 
     /// Count active sessions
     async fn count_active(&self) -> Result<usize>;
+
+    /// Atomic compare-and-swap update.
+    ///
+    /// Persists `session` only if the currently-stored version equals
+    /// `expected_version`. On success returns `Ok(())`. On version mismatch
+    /// returns `Err(Error::Conflict(..))` so the caller can reload, re-apply
+    /// their mutation against fresh state, and retry. On missing session
+    /// returns `Err(Error::NotFound(..))`.
+    ///
+    /// This is the OCC primitive that enables safe concurrent state
+    /// transitions for signaling messages such as `AcceptSession`. Backends
+    /// are expected to perform this operation atomically (e.g. via a row
+    /// lock, conditional UPDATE, or per-key map entry guard); the default
+    /// trait method is a non-atomic fallback so existing implementations
+    /// keep compiling, but production code paths must override it.
+    async fn update_if_unchanged(
+        &self,
+        session: &Session,
+        expected_version: u64,
+    ) -> Result<()> {
+        // Default fallback: non-atomic read-check-write. Override in real
+        // adapters with a backend-native CAS.
+        match self.find_by_id(session.id()).await? {
+            None => Err(crate::error::Error::NotFound(format!(
+                "Session {}",
+                session.id().as_uuid()
+            ))),
+            Some(current) if current.version() != expected_version => {
+                Err(crate::error::Error::Conflict(format!(
+                    "Session {} version mismatch: expected {}, found {}",
+                    session.id().as_uuid(),
+                    expected_version,
+                    current.version()
+                )))
+            }
+            Some(_) => self.save(session).await,
+        }
+    }
 }
 
 /// Repository for managing connection persistence
@@ -121,23 +159,23 @@ mod tests {
     #[async_trait]
     impl PeerRepository for MockPeerRepository {
         async fn save(&self, peer: &Peer) -> Result<()> {
-            let mut peers = self.peers.lock().unwrap();
+            let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
             peers.insert(peer.id().clone(), peer.clone());
             Ok(())
         }
 
         async fn find_by_id(&self, id: &PeerId) -> Result<Option<Peer>> {
-            let peers = self.peers.lock().unwrap();
+            let peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
             Ok(peers.get(id).cloned())
         }
 
         async fn find_active(&self) -> Result<Vec<Peer>> {
-            let peers = self.peers.lock().unwrap();
+            let peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
             Ok(peers.values().filter(|p| p.is_active()).cloned().collect())
         }
 
         async fn find_connected(&self) -> Result<Vec<Peer>> {
-            let peers = self.peers.lock().unwrap();
+            let peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
             Ok(peers
                 .values()
                 .filter(|p| p.is_connected())
@@ -146,23 +184,23 @@ mod tests {
         }
 
         async fn delete(&self, id: &PeerId) -> Result<()> {
-            let mut peers = self.peers.lock().unwrap();
+            let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
             peers.remove(id);
             Ok(())
         }
 
         async fn exists(&self, id: &PeerId) -> Result<bool> {
-            let peers = self.peers.lock().unwrap();
+            let peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
             Ok(peers.contains_key(id))
         }
 
         async fn count(&self) -> Result<usize> {
-            let peers = self.peers.lock().unwrap();
+            let peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
             Ok(peers.len())
         }
 
         async fn count_active(&self) -> Result<usize> {
-            let peers = self.peers.lock().unwrap();
+            let peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
             Ok(peers.values().filter(|p| p.is_active()).count())
         }
     }

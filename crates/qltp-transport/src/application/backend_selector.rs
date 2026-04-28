@@ -89,7 +89,16 @@ impl BackendSelector {
 
         // Score and rank backends
         let mut scored_backends = self.score_backends(&available, criteria);
-        scored_backends.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // CORRECTNESS: scores come from arithmetic on platform metrics;
+        // an unusual config (zero throughput, zero latency, divide-by-zero
+        // in a future scoring component) could yield NaN, and the previous
+        // `.unwrap()` would panic the entire selection path. Treat
+        // unorderable pairs as Equal so selection still produces *some*
+        // backend deterministically rather than killing the process.
+        scored_backends.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Select best backend
         let (best_type, best_score) = scored_backends[0];

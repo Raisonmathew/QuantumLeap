@@ -196,9 +196,18 @@ impl BackendCapabilities {
 
         // Check transport-specific requirements
         match self.transport_type {
-            TransportType::IoUring => platform.supports_io_uring(),
-            TransportType::Dpdk => platform.supports_dpdk(),
-            TransportType::Quic | TransportType::Tcp => true,
+            // io_uring also requires the cargo feature to actually link the
+            // adapter; without it, the factory can't build a backend, so we
+            // mark it unavailable here too.
+            TransportType::IoUring => {
+                cfg!(all(feature = "io_uring", target_os = "linux"))
+                    && platform.supports_io_uring()
+            }
+            // DPDK has no working adapter in this build; marking it
+            // unavailable prevents the selector from ever choosing it.
+            TransportType::Dpdk => false,
+            TransportType::Quic => cfg!(feature = "quic"),
+            TransportType::Tcp => true,
         }
     }
 

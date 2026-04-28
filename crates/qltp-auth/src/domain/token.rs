@@ -1,17 +1,24 @@
 //! Authentication token entity
 
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 /// Authentication token entity
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct AuthToken(String);
 
 impl AuthToken {
-    /// Create a new random authentication token
+    /// Create a new random authentication token (256 bits of entropy from the
+    /// OS CSPRNG, hex-encoded). Suitable for use as an opaque session token.
+    ///
+    /// UUID v4 was previously used here but only carries 122 bits of entropy
+    /// and is not specified to come from a CSPRNG, so it is unsuitable for
+    /// auth bearer tokens.
     pub fn new() -> Self {
-        Self(Uuid::new_v4().to_string())
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        Self(hex::encode(bytes))
     }
 
     /// Create token from string
@@ -24,7 +31,11 @@ impl AuthToken {
         &self.0
     }
 
-    /// Generate token from credentials (deterministic)
+    /// Generate a deterministic identifier from credentials.
+    ///
+    /// **Not** for use as a session/bearer token: the output is fully
+    /// determined by `(username, password)`, so anyone who learns the password
+    /// can recompute it. Use [`AuthToken::new`] for session tokens.
     pub fn from_credentials(username: &str, password: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(username.as_bytes());

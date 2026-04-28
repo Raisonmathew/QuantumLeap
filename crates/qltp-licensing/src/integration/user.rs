@@ -172,20 +172,25 @@ impl UserAccount {
 
     /// Get email
     pub fn email(&self) -> &str {
-    
-    /// Verify password against stored hash
-    /// Returns true if password matches, false otherwise
-    pub fn verify_password(&self, password: &str) -> bool {
-        if let Some(ref hash) = self.password_hash {
-            // In a real implementation, use a proper password hashing library like argon2 or bcrypt
-            // For now, this is a placeholder that does basic comparison
-            // TODO: Implement proper password verification with argon2/bcrypt
-            hash == password
-        } else {
-            false
-        }
-    }
         &self.email
+    }
+
+    /// Verify a password against the stored Argon2id PHC hash.
+    ///
+    /// Returns `true` if the password matches. Any parse error or absence of
+    /// a stored hash returns `false`. Verification is constant-time inside
+    /// the underlying Argon2 implementation.
+    pub fn verify_password(&self, password: &str) -> bool {
+        use password_hash::PasswordVerifier;
+        let Some(stored) = self.password_hash.as_deref() else {
+            return false;
+        };
+        match password_hash::PasswordHash::new(stored) {
+            Ok(parsed) => argon2::Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok(),
+            Err(_) => false,
+        }
     }
 
     /// Get name

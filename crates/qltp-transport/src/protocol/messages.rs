@@ -260,10 +260,13 @@ impl HelloMessage {
             flags: 0,
             client_id,
             capabilities: capabilities.0,
+            // RELIABILITY: a system clock set before UNIX_EPOCH would
+            // make `duration_since(UNIX_EPOCH)` return Err and panic.
+            // Treat that as t=0 instead of crashing the protocol layer.
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         }
     }
 }
@@ -293,8 +296,8 @@ impl WelcomeMessage {
             max_parallel_streams: 4,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         }
     }
 }
@@ -401,8 +404,8 @@ impl ChunkAckMessage {
             received_size,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         }
     }
 }
